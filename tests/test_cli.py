@@ -8,13 +8,15 @@ Uses extensive mocking to intercept API calls across all command modules.
 
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import jwt
 import pytest
 from typer.testing import CliRunner
 
 from memanto.app.clients.backend import Backend
+from memanto.cli.client import direct_client as direct_client_module
+from memanto.cli.client.direct_client import DirectClient
 from memanto.cli.main import app
 
 runner = CliRunner()
@@ -66,6 +68,7 @@ def mock_all_clients():
                 "port": 8000,
                 "auto_start": False,
             }
+            mock_cfg.get_server_url.return_value = "http://localhost:8000"
             mock_cfg.get_session_config.return_value = {
                 "default_duration_hours": 6,
                 "auto_renew_enabled": True,
@@ -121,6 +124,45 @@ def mock_all_clients():
         p.stop()
 
 
+def _conflict(letter: str) -> dict:
+    return {
+        "type": "contradiction",
+        "title": f"Conflict {letter}",
+        "old_memory_id": f"{letter}_old",
+        "old_content": f"old {letter}",
+        "new_memory_id": f"{letter}_new",
+        "new_content": f"new {letter}",
+        "description": f"conflict {letter}",
+        "recommendation": "keep_new",
+        "resolved": False,
+        "resolution": None,
+    }
+
+
+def _write_conflict_report(
+    tmp_path, agent_id: str, date: str, conflicts: list[dict]
+) -> None:
+    path = tmp_path / ".memanto" / "conflicts" / f"{agent_id}_{date}_conflicts.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(conflicts), encoding="utf-8")
+
+
+def _make_direct_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        direct_client_module.Path, "home", classmethod(lambda cls: tmp_path)
+    )
+    client = DirectClient(api_key="test-key")
+    mock_write = MagicMock()
+    mock_write.delete_memory.return_value = True
+    mock_write.store_memory.return_value = {"id": "manual_new"}
+    client._write_service = mock_write
+    return client, mock_write
+
+
+def _deleted_ids(mock_write) -> list[str]:
+    return [call.args[0] for call in mock_write.delete_memory.call_args_list]
+
+
 class TestMEMANTOCLI:
     """Integration tests for MEMANTO CLI commands"""
 
@@ -130,12 +172,41 @@ class TestMEMANTOCLI:
         assert result.exit_code == 0
         assert "Memory that AI Agents Love!" in result.stdout
 
-    def test_status_command(self, mock_all_clients):
+    @patch("memanto.cli.commands.core.httpx.get")
+    def test_status_command(self, mock_get, mock_all_clients):
         """Test 'memanto status'"""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "status": "healthy",
+            "version": "1.0.0",
+            "moorcheh_connected": True,
+        }
+        mock_get.return_value = mock_response
+
         # Status command might use helper functions, let's just check it runs
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0
         assert "MEMANTO Status" in result.stdout
+
+    @patch("memanto.cli.commands.core.httpx.get")
+    def test_status_lists_registered_agents(self, mock_get, mock_all_clients):
+        """list_agents() returns {"agents": [...]} — status must unwrap it."""
+        mock_get.side_effect = ConnectionError("offline")
+        mock_all_clients.get_session_info.return_value = {"agent_id": "test-agent"}
+        mock_all_clients.list_agents.return_value = {
+            "agents": [
+                {"agent_id": "test-agent", "pattern": "tool", "session_count": 2},
+                {"agent_id": "other-agent", "pattern": "tool", "session_count": 1},
+            ],
+            "count": 2,
+            "warnings": [],
+        }
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0, result.stdout
+        assert "Could not fetch agent list" not in result.stdout
+        assert "Registered Agents" in result.stdout
+        assert "other-agent" in result.stdout
 
     # ========================================================================
     # AGENT COMMANDS
@@ -169,10 +240,13 @@ class TestMEMANTOCLI:
 
     def test_agent_list(self, mock_all_clients):
         """Test 'memanto agent list'"""
-        mock_all_clients.list_agents.return_value = [
-            {"agent_id": "agent-1", "pattern": "support", "description": "Desc 1"},
-            {"agent_id": "agent-2", "pattern": "tool", "description": "Desc 2"},
-        ]
+        mock_all_clients.list_agents.return_value = {
+            "agents": [
+                {"agent_id": "agent-1", "pattern": "support", "description": "Desc 1"},
+                {"agent_id": "agent-2", "pattern": "tool", "description": "Desc 2"},
+            ],
+            "warnings": [],
+        }
 
         result = runner.invoke(app, ["agent", "list"])
         assert result.exit_code == 0
@@ -226,6 +300,35 @@ class TestMEMANTOCLI:
         mock_all_clients.remember.assert_called_once()
         assert mock_all_clients.remember.call_args.kwargs["title"] == "Custom Title"
 
+    def test_remember_attributes_the_write_to_the_calling_tool(
+        self, mock_all_clients, monkeypatch
+    ):
+        """Without --source, the write is credited to the tool that ran it.
+
+        This is what makes the Connections view able to say which agent
+        produced which memory; a bare terminal still writes as "user".
+        """
+        mock_all_clients.remember.return_value = {"memory_id": "m1", "status": "queued"}
+        monkeypatch.setenv("CLAUDECODE", "1")
+
+        result = runner.invoke(app, ["remember", "Detected source memory"])
+
+        assert result.exit_code == 0
+        assert mock_all_clients.remember.call_args.kwargs["source"] == "claude-code"
+
+    def test_remember_source_flag_overrides_detection(
+        self, mock_all_clients, monkeypatch
+    ):
+        mock_all_clients.remember.return_value = {"memory_id": "m1", "status": "queued"}
+        monkeypatch.setenv("CLAUDECODE", "1")
+
+        result = runner.invoke(
+            app, ["remember", "Explicit source memory", "--source", "user"]
+        )
+
+        assert result.exit_code == 0
+        assert mock_all_clients.remember.call_args.kwargs["source"] == "user"
+
     def test_recall_displays_string_numeric_fields(self, mock_all_clients):
         """Recall output should not crash when API metadata numbers are strings."""
         mock_all_clients.recall.return_value = {
@@ -236,7 +339,6 @@ class TestMEMANTOCLI:
                     "content": "Prefers concise reports",
                     "type": "preference",
                     "confidence": "0.75",
-                    "computed_confidence": "0.66",
                     "score": "0.812",
                     "tags": ["ux"],
                 },
@@ -257,7 +359,7 @@ class TestMEMANTOCLI:
         assert result.exit_code == 0
         assert "Stored preference" in result.stdout
         assert "Stored fact" in result.stdout
-        assert "Confidence: 0.66 (computed) | Score: 0.812" in result.stdout
+        assert "Confidence: 0.75 | Score: 0.812" in result.stdout
         assert "Confidence: 0.41 | Score: 0.500" in result.stdout
 
     def test_edit(self, mock_all_clients):
@@ -509,6 +611,46 @@ class TestMEMANTOCLI:
                 )
 
         mock_write_service.batch_store_memories.assert_not_called()
+
+    @pytest.mark.parametrize("client_path", ["direct_client", "sdk_client"])
+    def test_batch_clients_preserve_temporal_metadata(
+        self, mock_all_clients, client_path
+    ):
+        """Migration writes must not turn expiring memories into permanent ones."""
+        if client_path == "direct_client":
+            from memanto.cli.client.direct_client import DirectClient as Client
+        else:
+            from memanto.cli.client.sdk_client import SdkClient as Client
+
+        mock_write_service = MagicMock()
+        mock_write_service.batch_store_memories.return_value = {"results": []}
+        mock_session = MagicMock()
+        mock_session.namespace = "memanto_agent_test-agent"
+        updated_at = datetime(2026, 6, 1, 9, 15, tzinfo=timezone.utc)
+
+        with (
+            patch.object(Client, "_get_write_service", return_value=mock_write_service),
+            patch.object(
+                Client,
+                "_get_validated_session_for_agent",
+                return_value=mock_session,
+            ),
+        ):
+            client = Client.__new__(Client)
+            client.api_key = "test-api-key"
+            client.session_token = None
+            client.batch_remember(
+                agent_id="test-agent",
+                memories=[
+                    {
+                        "content": "Temporary operational context",
+                        "updated_at": updated_at,
+                    }
+                ],
+            )
+
+        record = mock_write_service.batch_store_memories.call_args.args[0][0]
+        assert record.updated_at == updated_at
 
     def test_edit_sdk_normalizes_confidence_and_accepts_valid_payload(
         self, mock_all_clients
@@ -791,6 +933,18 @@ class TestMEMANTOCLI:
         assert "Invalid timestamp format" in result.stdout
         mock_all_clients.recall_changed_since.assert_not_called()
 
+    def test_recall_as_of_yesterday_uses_end_of_day(self, mock_all_clients):
+        """Relative as-of recall must include the whole of yesterday."""
+        from memanto.app.utils.temporal_helpers import get_yesterday_range
+
+        mock_all_clients.recall_as_of.return_value = {"memories": [], "count": 0}
+        _, yesterday_end = get_yesterday_range()
+
+        result = runner.invoke(app, ["recall", "--as-of", "yesterday"])
+
+        assert result.exit_code == 0
+        assert mock_all_clients.recall_as_of.call_args.kwargs["as_of"] == yesterday_end
+
     @pytest.mark.parametrize(
         "client_class_path",
         [
@@ -940,8 +1094,9 @@ class TestMEMANTOCLI:
         )
         assert result.exit_code == 0
         assert "deleted" in result.stdout.lower()
-        mock_all_clients.delete_agent.assert_called_once_with("test-agent")
-        mock_all_clients._get_moorcheh.return_value.namespaces.delete.assert_not_called()
+        mock_all_clients.delete_agent.assert_called_once_with(
+            "test-agent", delete_memories=False
+        )
 
     def test_agent_delete_purge_cloud(self, mock_all_clients):
         """Test 'memanto agent delete --force' also deleting cloud namespace"""
@@ -949,18 +1104,44 @@ class TestMEMANTOCLI:
             "status": "deleted",
             "agent_id": "test-agent",
         }
-        mock_moorcheh = MagicMock()
-        mock_all_clients._get_moorcheh.return_value = mock_moorcheh
 
         # Answer "n" to delete cloud memories too
         result = runner.invoke(
             app, ["agent", "delete", "test-agent", "--force"], input="n\n"
         )
         assert result.exit_code == 0
-        assert "deleted" in result.stdout.lower()
-        mock_moorcheh.namespaces.delete.assert_called_once_with(
-            "memanto_agent_test-agent"
+        assert "cloud memories deleted" in result.stdout.lower()
+        mock_all_clients.delete_agent.assert_called_once_with(
+            "test-agent", delete_memories=True
         )
+
+    @pytest.mark.parametrize(
+        ("flag", "expected"),
+        [("--delete-memories", True), ("--keep-memories", False)],
+    )
+    def test_agent_delete_memories_flag_skips_prompt(
+        self, mock_all_clients, flag, expected
+    ):
+        """--delete-memories / --keep-memories answer the prompt for scripts."""
+        result = runner.invoke(app, ["agent", "delete", "test-agent", "--force", flag])
+        assert result.exit_code == 0
+        assert "Keep cloud memories" not in result.stdout
+        mock_all_clients.delete_agent.assert_called_once_with(
+            "test-agent", delete_memories=expected
+        )
+
+    def test_agent_delete_memories_failure_reports_agent_kept(self, mock_all_clients):
+        """A failed cloud delete is an error, not a 'deleted' message."""
+        from memanto.app.utils.errors import NamespaceError
+
+        mock_all_clients.delete_agent.side_effect = NamespaceError(
+            "Failed to delete namespace 'memanto_agent_test-agent' in Moorcheh: boom"
+        )
+        result = runner.invoke(
+            app, ["agent", "delete", "test-agent", "--force", "--delete-memories"]
+        )
+        assert result.exit_code != 0
+        assert "was not deleted" in result.stdout
 
     def test_agent_delete_not_found(self, mock_all_clients):
         """Test 'memanto agent delete' when agent does not exist"""
@@ -1098,9 +1279,19 @@ class TestMEMANTOCLI:
         mock_all_clients.generate_daily_summary.return_value = {
             "summary": {"status": "success", "summary_path": "summary.md"},
         }
-        result = runner.invoke(app, ["daily-summary"])
+        with patch(
+            "memanto.cli.commands.memory.utc_date_str",
+            return_value="2026-07-30",
+        ):
+            result = runner.invoke(app, ["daily-summary"])
+
         assert result.exit_code == 0
         assert "generated" in result.stdout.lower()
+        mock_all_clients.generate_daily_summary.assert_called_once_with(
+            agent_id="test-agent",
+            date="2026-07-30",
+            output_path=None,
+        )
 
     def test_detect_conflicts(self, mock_all_clients):
         """Test 'memanto detect-conflicts'"""
@@ -1111,9 +1302,19 @@ class TestMEMANTOCLI:
                 "json_path": "conflicts.json",
             },
         }
-        result = runner.invoke(app, ["detect-conflicts"])
+        with patch(
+            "memanto.cli.commands.memory.utc_date_str",
+            return_value="2026-07-30",
+        ):
+            result = runner.invoke(app, ["detect-conflicts"])
+
         assert result.exit_code == 0
         assert "conflict report generated" in result.stdout.lower()
+        mock_all_clients.generate_conflict_report.assert_called_once_with(
+            agent_id="test-agent",
+            date="2026-07-30",
+            on_progress=ANY,
+        )
 
     def test_conflicts_list(self, mock_all_clients):
         """Test 'memanto conflicts --list'"""
@@ -1126,9 +1327,145 @@ class TestMEMANTOCLI:
                 "recommendation": "merge",
             }
         ]
-        result = runner.invoke(app, ["conflicts", "--list"])
+        with patch(
+            "memanto.cli.commands.memory.utc_date_str",
+            return_value="2026-07-30",
+        ):
+            result = runner.invoke(app, ["conflicts", "--list"])
+
         assert result.exit_code == 0
         assert "Found 1 unresolved conflict" in result.stdout
+        mock_all_clients.list_conflicts.assert_called_once_with(
+            agent_id="test-agent",
+            date="2026-07-30",
+        )
+
+    def test_list_conflicts_exposes_stable_full_report_index(
+        self, tmp_path, monkeypatch
+    ):
+        """Unresolved conflicts keep their original full-report index."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(
+            tmp_path, agent_id, date, [_conflict("A"), _conflict("B"), _conflict("C")]
+        )
+        client, _ = _make_direct_client(tmp_path, monkeypatch)
+
+        listed = client.list_conflicts(agent_id=agent_id, date=date)
+        assert [(c["title"], c["index"]) for c in listed] == [
+            ("Conflict A", 0),
+            ("Conflict B", 1),
+            ("Conflict C", 2),
+        ]
+
+        client.resolve_conflict(agent_id, date, conflict_index=0, action="keep_new")
+        listed_after = client.list_conflicts(agent_id=agent_id, date=date)
+        assert [(c["title"], c["index"]) for c in listed_after] == [
+            ("Conflict B", 1),
+            ("Conflict C", 2),
+        ]
+
+    def test_resolving_by_provided_index_deletes_the_correct_memory(
+        self, tmp_path, monkeypatch
+    ):
+        """Resolve by stable index so only the selected memory is deleted."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(
+            tmp_path, agent_id, date, [_conflict("A"), _conflict("B"), _conflict("C")]
+        )
+        client, mock_write = _make_direct_client(tmp_path, monkeypatch)
+
+        a = next(
+            c
+            for c in client.list_conflicts(agent_id=agent_id, date=date)
+            if c["title"] == "Conflict A"
+        )
+        client.resolve_conflict(
+            agent_id, date, conflict_index=a["index"], action="keep_new"
+        )
+        assert _deleted_ids(mock_write) == ["A_old"]
+
+        remaining = client.list_conflicts(agent_id=agent_id, date=date)
+        c = next(x for x in remaining if x["title"] == "Conflict C")
+        client.resolve_conflict(
+            agent_id, date, conflict_index=c["index"], action="keep_new"
+        )
+
+        assert _deleted_ids(mock_write)[1:] == ["C_old"]
+
+        report = json.loads(
+            (
+                tmp_path
+                / ".memanto"
+                / "conflicts"
+                / f"{agent_id}_{date}_conflicts.json"
+            ).read_text(encoding="utf-8")
+        )
+        by_title = {row["title"]: row for row in report}
+        assert by_title["Conflict C"]["resolved"] is True
+        assert by_title["Conflict B"]["resolved"] is False
+
+    def test_resolving_an_already_resolved_index_is_rejected(
+        self, tmp_path, monkeypatch
+    ):
+        """Resolved conflicts cannot be resolved again by stale indexes."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(
+            tmp_path, agent_id, date, [_conflict("A"), _conflict("B")]
+        )
+        client, mock_write = _make_direct_client(tmp_path, monkeypatch)
+
+        client.resolve_conflict(agent_id, date, conflict_index=0, action="keep_new")
+        assert _deleted_ids(mock_write) == ["A_old"]
+
+        with pytest.raises(ValueError, match="already resolved"):
+            client.resolve_conflict(agent_id, date, conflict_index=0, action="keep_new")
+
+        assert _deleted_ids(mock_write) == ["A_old"]
+
+    @pytest.mark.parametrize(
+        "action,expected",
+        [
+            ("expire_old", ["A_old"]),
+            ("expire_new", ["A_new"]),
+            ("expire_both", ["A_old", "A_new"]),
+        ],
+    )
+    def test_expire_actions_retire_without_deleting(
+        self, tmp_path, monkeypatch, action, expected
+    ):
+        """The expire_* actions stamp the losing memory instead of deleting it."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(tmp_path, agent_id, date, [_conflict("A")])
+        client, mock_write = _make_direct_client(tmp_path, monkeypatch)
+
+        client.resolve_conflict(agent_id, date, conflict_index=0, action=action)
+
+        expired = [call.args[0] for call in mock_write.set_lifecycle.call_args_list]
+        assert expired == expected
+        assert _deleted_ids(mock_write) == [], "expiring must not delete"
+
+        for call in mock_write.set_lifecycle.call_args_list:
+            assert call.kwargs["expired"] is True
+            assert call.kwargs["reason"] == "conflict-resolution"
+
+    def test_expire_action_marks_the_conflict_resolved(self, tmp_path, monkeypatch):
+        """An expiry resolves the conflict just like a delete does."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(tmp_path, agent_id, date, [_conflict("A")])
+        client, _ = _make_direct_client(tmp_path, monkeypatch)
+
+        client.resolve_conflict(agent_id, date, conflict_index=0, action="expire_old")
+
+        assert client.list_conflicts(agent_id=agent_id, date=date) == []
+
+    def test_unknown_action_is_rejected(self, tmp_path, monkeypatch):
+        """A typo'd action must not silently do nothing."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(tmp_path, agent_id, date, [_conflict("A")])
+        client, _ = _make_direct_client(tmp_path, monkeypatch)
+
+        with pytest.raises(ValueError, match="Invalid action"):
+            client.resolve_conflict(agent_id, date, conflict_index=0, action="expire")
 
     def test_memory_export(self, mock_all_clients):
         """Test 'memanto memory export'"""
@@ -1166,16 +1503,16 @@ class TestMEMANTOCLI:
 
         session_mock.assert_not_called()
 
-    def test_memory_sync(self, mock_all_clients):
+    @patch("memanto.cli.connect.updater.inject_dynamic_memories")
+    def test_memory_sync(self, mock_inject, mock_all_clients):
         """Test 'memanto memory sync'"""
-        mock_all_clients.sync_memory_to_project.return_value = {
-            "total_memories": 5,
-            "source": "cache",
-            "output_path": "project/memory.md",
+        mock_all_clients.recall.return_value = {
+            "memories": [{"type": "instruction", "content": "Test instruction"}] * 5
         }
+        mock_inject.return_value = {"updated": ["Injected successfully"]}
         result = runner.invoke(app, ["memory", "sync"])
         assert result.exit_code == 0
-        assert "Synced 5 memories" in result.stdout
+        assert "Recalled 5 dynamic memories" in result.stdout
 
     def test_schedule_commands(self, mock_all_clients):
         """Test schedule commands"""

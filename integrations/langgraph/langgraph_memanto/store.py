@@ -9,6 +9,9 @@ Mapping between abstractions
 
     BaseStore                         ->  Memanto
     namespace (tuple[str, ...])       ->  agent_id       (``langgraph_<p0>_<p1>...``)
+                                          (bound to the exact tuple via the
+                                          agent description; a colliding
+                                          tuple is refused)
     key (str)                         ->  reserved tag   ``lg:key:<key>``
     value["kind"] / value["type"]     ->  memory_type    (auto-parsed if absent)
     value["title"]                    ->  title          (auto-derived if absent)
@@ -17,7 +20,8 @@ Mapping between abstractions
     value["tags"]                     ->  user tags (non-reserved)
     SearchOp.query                    ->  recall query   (``recall_recent`` if ``"*"``)
     SearchOp.filter["type"]           ->  type filter
-    SearchOp.filter["min_confidence"] ->  min_similarity
+    SearchOp.filter["min_similarity"] ->  semantic similarity threshold
+    SearchOp.filter["min_confidence"] ->  memory confidence threshold
 
 Documented limitations
 ----------------------
@@ -29,11 +33,15 @@ Documented limitations
 * **_do_get** is best-effort: uses ``recall_recent`` (unbiased by query)
   up to the 100-result cap, then a semantic fallback. A key stored long
   ago beyond the cap window may not be found.
+* **Cross-process puts** rely on backend coordination. This adapter serializes
+  puts for the same key within one ``MemantoStore`` instance, including
+  concurrent ``abatch`` calls, but cannot make separate processes atomic.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -59,6 +67,11 @@ logger = logging.getLogger(__name__)
 _KEY_TAG_PREFIX = "lg:key:"
 _ENCODED_KEY_TAG_PREFIX = "lg:key:v1:"
 _RESERVED_PREFIX = "lg:"
+# Stored as the agent description so each agent remembers the exact namespace
+# tuple it was created for. ``"_".join(namespace)`` is not injective (e.g.
+# ("acme", "bob_x") and ("acme_bob", "x") share one agent id), so the binding
+# is what keeps two colliding namespaces from reading each other's memories.
+_NAMESPACE_BINDING_PREFIX = "langgraph-namespace:"
 
 _VALID_MEMORY_TYPES = {
     "fact",
@@ -99,33 +112,101 @@ class MemantoStore(BaseStore):
     # nodes) from burning rate-limit budget on identical queries.
     _CACHE_TTL_S = 30.0
 
-    def __init__(self, api_key: str) -> None:
-        """Initialize MemantoStore with an API key."""
+    def __init__(self, api_key: str, *, strict_namespace_binding: bool = False) -> None:
+        """Initialize MemantoStore with an API key.
+
+        Args:
+            api_key: Memanto / Moorcheh API key.
+            strict_namespace_binding: Refuse agents created before namespace
+                binding existed. Such agents have no record of which namespace
+                tuple they belong to, so a colliding tuple could still reach
+                them. Off by default so existing stores keep their memories.
+        """
         self.api_key = api_key
+        self._strict_namespace_binding = strict_namespace_binding
         self._lock = threading.RLock()
+        self._key_locks: dict[tuple[tuple[str, ...], str], threading.Lock] = {}
         self._client_pool: dict[str, SdkClient] = {}
+        # agent_id -> the namespace tuple its pooled client was bound for.
+        self._pool_namespaces: dict[str, tuple[str, ...]] = {}
         self._agent_prefix = "langgraph_"
-        # (namespace, query, limit, type, min_sim) -> (timestamp, list[SearchItem])
+        # (namespace, query, limit, tags, type, min_sim, min_conf) -> (timestamp, items)
         self._search_cache: dict[tuple, tuple[float, list[SearchItem]]] = {}
-        # Survives 429s without flashing the UI panel to zero.
-        self._last_good: dict[tuple[str, ...], list[SearchItem]] = {}
+
+    def _agent_id_for(self, namespace: tuple[str, ...]) -> str:
+        ns_str = "_".join(namespace) or "default"
+        return f"{self._agent_prefix}{ns_str}"
+
+    @staticmethod
+    def _namespace_binding(namespace: tuple[str, ...]) -> str:
+        return _NAMESPACE_BINDING_PREFIX + json.dumps(
+            list(namespace), ensure_ascii=False, separators=(",", ":")
+        )
+
+    @staticmethod
+    def _bound_namespace(description: Any) -> tuple[str, ...] | None:
+        """Return the namespace recorded in an agent description, if any."""
+        if not isinstance(description, str) or not description.startswith(
+            _NAMESPACE_BINDING_PREFIX
+        ):
+            return None
+        try:
+            parts = json.loads(description[len(_NAMESPACE_BINDING_PREFIX) :])
+        except ValueError:
+            return None
+        if not isinstance(parts, list) or not all(isinstance(p, str) for p in parts):
+            return None
+        return tuple(parts)
+
+    @staticmethod
+    def _namespace_collision(
+        namespace: tuple[str, ...], agent_id: str, bound: tuple[str, ...]
+    ) -> ValueError:
+        return ValueError(
+            f"LangGraph namespace {namespace!r} maps to Memanto agent "
+            f"'{agent_id}', which already belongs to namespace {bound!r}. "
+            "Refusing to share memories between different namespaces."
+        )
 
     def _ensure_client(self, namespace: tuple[str, ...]) -> tuple[SdkClient, str]:
-        ns_str = "_".join(namespace) or "default"
-        agent_id = f"{self._agent_prefix}{ns_str}"
+        namespace = tuple(namespace)
+        agent_id = self._agent_id_for(namespace)
         with self._lock:
             if agent_id in self._client_pool:
+                bound = self._pool_namespaces.get(agent_id, namespace)
+                if bound != namespace:
+                    raise self._namespace_collision(namespace, agent_id, bound)
                 return self._client_pool[agent_id], agent_id
 
             from memanto.app.utils.errors import AgentAlreadyExistsError
 
             client = SdkClient(api_key=self.api_key)
             try:
-                client.create_agent(agent_id=agent_id, pattern="tool")
+                client.create_agent(
+                    agent_id=agent_id,
+                    pattern="tool",
+                    description=self._namespace_binding(namespace),
+                )
             except AgentAlreadyExistsError:
-                pass
+                existing = client.get_agent(agent_id)
+                description = (
+                    existing.get("description") if isinstance(existing, dict) else None
+                )
+                bound = self._bound_namespace(description)
+                # Agents created before the binding existed carry no record of
+                # their namespace. By default keep serving them so existing
+                # memories stay reachable; strict mode refuses them instead.
+                if bound is None and self._strict_namespace_binding:
+                    raise ValueError(
+                        f"Memanto agent '{agent_id}' has no namespace binding, so "
+                        f"it cannot be verified to belong to {namespace!r}. "
+                        "Refusing it because strict_namespace_binding is enabled."
+                    )
+                if bound is not None and bound != namespace:
+                    raise self._namespace_collision(namespace, agent_id, bound)
             client.activate_agent(agent_id=agent_id)
             self._client_pool[agent_id] = client
+            self._pool_namespaces[agent_id] = namespace
             return client, agent_id
 
     # ------------------------------------------------------------------ #
@@ -162,7 +243,7 @@ class MemantoStore(BaseStore):
     # GET                                                                #
     # ------------------------------------------------------------------ #
 
-    def _do_get(self, op: GetOp) -> Item | None:
+    def _do_get(self, op: GetOp, *, strict: bool = False) -> Item | None:
         """Lookup a single memory by key.
 
         Uses ``recall_recent`` first (no semantic bias) so the target memory
@@ -192,6 +273,10 @@ class MemantoStore(BaseStore):
                 tags=[key_tag],
             )
         except Exception as exc:
+            if strict:
+                raise RuntimeError(
+                    f"Cannot safely determine whether key {op.key!r} exists"
+                ) from exc
             logger.warning("MemantoStore._do_get fallback recall failed: %s", exc)
             return None
 
@@ -232,11 +317,12 @@ class MemantoStore(BaseStore):
         raw_content = value.pop("content", None)
         if raw_content is None:
             raw_content = self._stringify(value)
+        content = str(raw_content)
 
         title = value.pop("title", None)
         if not title:
-            title = raw_content if len(raw_content) <= 80 else raw_content[:77] + "..."
-        title = title[:100]
+            title = content if len(content) <= 80 else content[:77] + "..."
+        title = str(title)[:100]
 
         confidence = float(value.pop("confidence", 0.8))
         confidence = max(0.0, min(1.0, confidence))
@@ -248,18 +334,47 @@ class MemantoStore(BaseStore):
         all_tags = user_tags + [self._key_to_tag(op.key)]
 
         client, agent_id = self._ensure_client(op.namespace)
-        client.remember(
-            agent_id=agent_id,
-            memory_type=memory_type,
-            title=title,
-            content=str(raw_content),
-            confidence=confidence,
-            tags=all_tags,
-            source="langgraph-store",
-            provenance="explicit_statement",
-        )
 
-        # Invalidate cached searches for this namespace
+        lock_key = (op.namespace, op.key)
+        with self._lock:
+            if lock_key not in self._key_locks:
+                self._key_locks[lock_key] = threading.Lock()
+            key_lock = self._key_locks[lock_key]
+
+        with key_lock:
+            existing = self._do_get(
+                GetOp(namespace=op.namespace, key=op.key), strict=True
+            )
+            existing_id = existing.value.get("memory_id") if existing else None
+
+            if existing_id:
+                updates: dict[str, Any] = {
+                    "title": title,
+                    "content": str(raw_content),
+                    "confidence": confidence,
+                    "tags": all_tags,
+                    "source": "langgraph-store",
+                }
+                if memory_type is not None:
+                    updates["type"] = memory_type
+                client.update_memory(
+                    agent_id=agent_id,
+                    memory_id=str(existing_id),
+                    updates=updates,
+                )
+            else:
+                client.remember(
+                    agent_id=agent_id,
+                    memory_type=memory_type,
+                    title=title,
+                    content=str(raw_content),
+                    confidence=confidence,
+                    tags=all_tags,
+                    source="langgraph-store",
+                    provenance="explicit_statement",
+                )
+
+        # Invalidate search cache for this namespace because we mutated it
         prefix = op.namespace
         with self._lock:
             self._search_cache = {
@@ -285,8 +400,8 @@ class MemantoStore(BaseStore):
         type_filter = filter_dict.get("type") or filter_dict.get("kind")
         if isinstance(type_filter, str):
             type_filter = [type_filter]
-        # SearchOp uses "min_confidence"; SdkClient.recall() uses "min_similarity"
-        min_similarity = filter_dict.get("min_confidence")
+        min_similarity = filter_dict.get("min_similarity")
+        min_confidence = filter_dict.get("min_confidence")
         extra_tags = self._normalize_tags(filter_dict.get("tags"))
 
         cache_key = (
@@ -296,6 +411,7 @@ class MemantoStore(BaseStore):
             tuple(extra_tags),
             tuple(type_filter) if type_filter else None,
             min_similarity,
+            min_confidence,
         )
         with self._lock:
             cached = self._search_cache.get(cache_key)
@@ -304,8 +420,10 @@ class MemantoStore(BaseStore):
                 if time.time() - ts < self._CACHE_TTL_S:
                     return items
 
-        fetch_limit = max(1, min(op.limit, self._MEMANTO_RECALL_CAP))
-        rate_limited = False
+        if min_confidence is not None:
+            fetch_limit = self._MEMANTO_RECALL_CAP
+        else:
+            fetch_limit = max(1, min(op.limit, self._MEMANTO_RECALL_CAP))
 
         client, agent_id = self._ensure_client(op.namespace_prefix)
 
@@ -328,23 +446,16 @@ class MemantoStore(BaseStore):
                 )
         except Exception as exc:
             logger.warning("MemantoStore._do_search recall failed: %s", exc)
-            err = str(exc)
-            if any(
-                m in err
-                for m in (
-                    "429",
-                    "Limit Exceeded",
-                )
-            ):
-                rate_limited = True
-                result = {"memories": []}
-            else:
-                return []
+            raise
 
         out: list[SearchItem] = []
         for mem in result.get("memories", []):
             tags = self._normalize_tags(mem.get("tags"))
             if extra_tags and not all(t in tags for t in extra_tags):
+                continue
+            if min_confidence is not None and not self._passes_min_confidence(
+                mem, min_confidence
+            ):
                 continue
             key = self._tags_to_key(tags) or mem.get("id", "")
             out.append(self._memory_to_search_item(mem, op.namespace_prefix, key))
@@ -352,16 +463,8 @@ class MemantoStore(BaseStore):
         out = out[: op.limit]
 
         with self._lock:
-            if not out and rate_limited and op.namespace_prefix in self._last_good:
-                logger.info(
-                    "MemantoStore: rate-limited, returning last-good for %r",
-                    op.namespace_prefix,
-                )
-                return self._last_good[op.namespace_prefix]
-
-            if out and not rate_limited:
+            if out:
                 self._search_cache[cache_key] = (time.time(), out)
-                self._last_good[op.namespace_prefix] = out
 
         return out
 
@@ -378,10 +481,34 @@ class MemantoStore(BaseStore):
             logger.warning("MemantoStore: Failed to list agents: %s", e)
             return []
 
+        if isinstance(agents, dict):
+            agent_items = agents.get("agents")
+            if not isinstance(agent_items, list):
+                logger.warning(
+                    "MemantoStore: unexpected list_agents payload keys: %s",
+                    sorted(agents),
+                )
+                return []
+        elif isinstance(agents, list):
+            agent_items = agents
+        else:
+            logger.warning(
+                "MemantoStore: unexpected list_agents payload type: %s",
+                type(agents).__name__,
+            )
+            return []
+
         namespaces = []
-        for agent in agents:
+        for agent in agent_items:
+            if not isinstance(agent, dict):
+                continue
             agent_id = agent.get("agent_id") or agent.get("id") or ""
-            if agent_id.startswith(self._agent_prefix):
+            if not isinstance(agent_id, str):
+                continue
+            bound = self._bound_namespace(agent.get("description"))
+            if bound is not None and self._agent_id_for(bound) == agent_id:
+                namespaces.append(bound)
+            elif agent_id.startswith(self._agent_prefix):
                 ns_str = agent_id[len(self._agent_prefix) :]
                 if ns_str == "default":
                     namespaces.append(())
@@ -423,6 +550,18 @@ class MemantoStore(BaseStore):
             if t.startswith(_KEY_TAG_PREFIX):
                 return t[len(_KEY_TAG_PREFIX) :]
         return None
+
+    @staticmethod
+    def _passes_min_confidence(mem: dict[str, Any], min_confidence: Any) -> bool:
+        try:
+            threshold = float(min_confidence)
+        except (TypeError, ValueError):
+            return False
+        try:
+            confidence = float(mem.get("confidence"))
+        except (TypeError, ValueError):
+            return threshold <= 0
+        return confidence >= threshold
 
     @staticmethod
     def _normalize_tags(raw: Any) -> list[str]:

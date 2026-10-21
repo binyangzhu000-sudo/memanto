@@ -2,23 +2,132 @@
 MEMANTO Core Architecture - Namespace Strategy & Memory Records
 """
 
+import re
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime, timezone
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 from memanto.app.constants import (
+    INJECTION_PATTERNS,
     MemoryType,
     ProvenanceType,
-    SourceType,
     StatusType,
 )
+
+# Tags are stored comma-joined and appended to the document text, so a comma
+# would split a tag and a line break or control character could forge
+# document structure. Everything else (e.g. ``lg:key:<key>``) is allowed.
+TAG_PATTERN = r"^[^,\x00-\x1f\x7f\x85\u2028\u2029]+$"
+
+_INJECTION_TAG_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE) for pattern in INJECTION_PATTERNS
+)
+
+
+def _reject_injection_shaped_tag(value: str) -> str:
+    """
+    Tags are comma-joined into the document text (``to_moorcheh_document``)
+    and rendered into session summaries and exports, so a tag must not carry
+    directive/override payloads or the documented ``#`` filter-token prefix
+    (see ``_sanitize_query_text``).
+    The extraction path enforces the same rule set
+    (``ConversationMemoryExtractionService._normalize_candidates``).
+    """
+    if value.startswith("#") or any(
+        pattern.search(value) for pattern in _INJECTION_TAG_PATTERNS
+    ):
+        raise ValueError(
+            "tag matches an injection directive or a '#'-prefixed filter token"
+        )
+    return value
+
+
+MemoryTag = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=64,
+        pattern=TAG_PATTERN,
+    ),
+    AfterValidator(_reject_injection_shaped_tag),
+]
+BoundedTags = Annotated[list[MemoryTag], Field(max_length=20)]
+
+BoundedSourceRef = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=512)
+]
+
+# Who wrote the memory: "user", "agent", "cursor", "codex", "claude_code",
+# "mem0", ... Deliberately open so every writer is identifiable in recall and
+# in the UI, but bounded to the Moorcheh filter-token charset so that
+# `#source:<value>` stays a usable observability filter — a space or a '#' in
+# the label would corrupt the query syntax it is embedded in.
+SOURCE_MAX_LENGTH = 64
+SOURCE_PATTERN = r"^[A-Za-z0-9._-]+$"
+
+MemorySource = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=SOURCE_MAX_LENGTH,
+        pattern=SOURCE_PATTERN,
+    ),
+]
+
+_SOURCE_RE = re.compile(SOURCE_PATTERN)
+
+# Why a memory was expired: a policy rule name, "manual", or
+# "conflict-resolution". Bounded to the same filter-token charset as
+# ``MemorySource`` so `#expired_by:<value>` stays a usable Moorcheh filter.
+EXPIRED_BY_MAX_LENGTH = 64
+EXPIRED_BY_PATTERN = SOURCE_PATTERN
+
+BoundedExpiredBy = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=EXPIRED_BY_MAX_LENGTH,
+        pattern=EXPIRED_BY_PATTERN,
+    ),
+]
+
+
+def is_valid_source(value: Any) -> bool:
+    """Return True when *value* is a source label ``MemorySource`` accepts."""
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    return bool(_SOURCE_RE.fullmatch(token)) and len(token) <= SOURCE_MAX_LENGTH
+
+
+def is_valid_expired_by(value: Any) -> bool:
+    """Return True when *value* is a reason label ``BoundedExpiredBy`` accepts."""
+    if not isinstance(value, str):
+        return False
+    token = value.strip()
+    return bool(_SOURCE_RE.fullmatch(token)) and len(token) <= EXPIRED_BY_MAX_LENGTH
 
 
 def agent_namespace(agent_id: str) -> str:
     """Map an agent_id to its Moorcheh namespace: memanto_agent_{agent_id}."""
     return f"memanto_agent_{agent_id}"
+
+
+# Every code point that Python's str.splitlines(), Markdown renderers, and
+# LLMs treat as a line break. Titles are single-line labels, so all of them
+# must be folded -- a partial set lets a title forge document structure.
+_TITLE_LINE_BREAKS = "\n\r\u2028\u2029\x0b\x0c\x85"
 
 
 class MemoryRecord(BaseModel):
@@ -30,14 +139,36 @@ class MemoryRecord(BaseModel):
     title: str = Field(max_length=100)
     content: str = Field(max_length=10000)
 
+    @field_validator("title", mode="before")
+    @classmethod
+    def _normalize_title_newlines(cls, value: Any) -> Any:
+        """Collapse line breaks in titles to single spaces.
+
+        Titles are single-line labels: the serialized document format is
+        ``[TYPE] title\\n\\ncontent``, so a newline inside the title corrupts
+        the title/content boundary on readback (the ``[TYPE]`` prefix leaks
+        into the recalled title and compounds on every update). Newline titles
+        arrive from any caller, including the derived-title fallback that
+        slices multi-line content.
+
+        The set of characters folded here must cover everything that
+        ``str.splitlines()``, Markdown renderers, and LLMs treat as a line
+        break -- not just ``\\n`` and ``\\r``. Folding only those two let
+        U+2028, U+2029, U+000B, U+000C and U+0085 through, which allowed a
+        title to forge standalone headings in the session summary.
+        """
+        if not isinstance(value, str):
+            return value
+        return re.sub(rf"[ \t]*[{_TITLE_LINE_BREAKS}]+[ \t]*", " ", value).strip()
+
     # Metadata fields
     agent_id: str
     actor_id: str
-    source: SourceType
-    source_ref: str | None = None
+    source: MemorySource
+    source_ref: BoundedSourceRef | None = None
     confidence: float = Field(ge=0.0, le=1.0, default=0.8)
     status: StatusType = "active"
-    tags: list[str] = Field(default_factory=list)
+    tags: BoundedTags = Field(default_factory=list)
 
     # Provenance
     provenance: ProvenanceType = "explicit_statement"
@@ -45,8 +176,13 @@ class MemoryRecord(BaseModel):
     # Timestamps (auto-populated by server)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    expires_at: datetime | None = None
-    ttl_seconds: int | None = Field(default=None, gt=0)
+
+    # Expiry stamp. Both are set together when a memory moves to `expired` and
+    # cleared together on restore, so `status == "expired"` always carries a
+    # when and a why. ``expired_by`` names the cause: a policy rule name,
+    # ``manual``, or ``conflict-resolution``.
+    expired_at: datetime | None = None
+    expired_by: BoundedExpiredBy | None = None
 
     def to_moorcheh_document(self) -> dict[str, Any]:
         """
@@ -85,13 +221,13 @@ class MemoryRecord(BaseModel):
             document["source_ref"] = self.source_ref
         if self.tags:
             document["tags"] = ",".join(self.tags)  # Comma-separated for filtering
-        if self.expires_at:
-            if isinstance(self.expires_at, datetime):
-                document["expires_at"] = self.expires_at.isoformat()
+        if self.expired_at:
+            if isinstance(self.expired_at, datetime):
+                document["expired_at"] = self.expired_at.isoformat()
             else:
-                document["expires_at"] = str(self.expires_at)
-        if self.ttl_seconds:
-            document["ttl_seconds"] = self.ttl_seconds
+                document["expired_at"] = str(self.expired_at)
+        if self.expired_by:
+            document["expired_by"] = self.expired_by
 
         return document
 
@@ -99,9 +235,14 @@ class MemoryRecord(BaseModel):
         """The Moorcheh namespace this memory belongs to."""
         return agent_namespace(self.agent_id)
 
-    def set_ttl(self, seconds: int):
-        """Set TTL and expiration"""
-        if seconds <= 0:
-            raise ValueError("ttl_seconds must be greater than 0")
-        self.ttl_seconds = seconds
-        self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    def expire(self, reason: str, when: datetime | None = None) -> None:
+        """Mark this memory expired, stamping when it happened and why."""
+        self.status = "expired"
+        self.expired_at = when or datetime.now(timezone.utc)
+        self.expired_by = reason
+
+    def restore(self) -> None:
+        """Return this memory to the active state, clearing the expiry stamp."""
+        self.status = "active"
+        self.expired_at = None
+        self.expired_by = None

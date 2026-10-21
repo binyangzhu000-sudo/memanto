@@ -11,6 +11,7 @@ import re
 import tempfile
 from datetime import date, datetime, time, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator
@@ -18,13 +19,14 @@ from pydantic import BaseModel, Field, field_validator
 from memanto.app.clients.backend import get_active_llm_model
 from memanto.app.clients.moorcheh import get_moorcheh_client
 from memanto.app.config import settings
-from memanto.app.constants import VALID_MEMORY_TYPES
-from memanto.app.core import MemoryRecord
+from memanto.app.constants import VALID_MEMORY_TYPES, MemoryType, StatusFilter
+from memanto.app.core import MemoryRecord, MemorySource
 from memanto.app.models import (
     AnswerRequest,
     AnswerResponse,
     BatchRememberRequest,
     BatchRememberResponse,
+    BoundedTags,
     ConflictResolveRequest,
     ExtractMemoriesRequest,
     RecallResponse,
@@ -34,13 +36,33 @@ from memanto.app.models import (
     UploadFileResponse,
 )
 from memanto.app.models.session import Session
-from memanto.app.routes.auth_deps import get_current_session, get_session_service
+from memanto.app.routes.auth_deps import (
+    get_current_session,
+    get_moorcheh_api_key,
+    get_session_service,
+)
 from memanto.app.services.conversation_memory_extraction_service import (
     ConversationMemoryExtractionService,
 )
+from memanto.app.services.memory_policy_service import (
+    MemoryPolicy,
+    MemoryPolicyService,
+)
 from memanto.app.services.memory_read_service import MemoryReadService
 from memanto.app.services.memory_write_service import MemoryWriteService
-from memanto.app.utils.errors import AuthorizationError, map_error_to_http_exception
+from memanto.app.services.policy_presets import PRESETS, list_presets, load_preset
+from memanto.app.utils.errors import (
+    AuthorizationError,
+    MemoryOperationError,
+    map_error_to_http_exception,
+    redact_sensitive_text,
+)
+from memanto.app.utils.temporal_helpers import (
+    END_OF_DAY,
+    is_date_only,
+    parse_date_only,
+    utc_date_str,
+)
 from memanto.app.utils.validation import (
     CostGuard,
     is_successful_write_result,
@@ -82,11 +104,43 @@ def _validate_memory_type_filters(value: list[str] | None) -> list[str] | None:
     return value
 
 
+_RECALL_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _validate_recall_tag_filters(value: list[str] | None) -> list[str] | None:
+    """Reject tag filter values that contain characters invalid in Moorcheh query syntax.
+
+    Tags are embedded as ``#<tag>`` tokens in Moorcheh search queries.
+    Values with spaces, colons, hash signs, or control characters would
+    cause _validate_filter_token() inside search_memories() to raise a
+    ValueError that is caught as a generic Exception and re-raised as a
+    MemoryOperationError — producing HTTP 500 from user-controlled input.
+    Validating here returns HTTP 422 with a clear message instead.
+    """
+    if value is None:
+        return value
+    for tag in value:
+        stripped = str(tag).strip()
+        if not stripped or not _RECALL_TAG_RE.fullmatch(stripped):
+            raise ValueError(
+                f"Invalid tag filter '{tag}': only letters, digits, '.', '_', "
+                "and '-' are allowed in recall tag filters."
+            )
+    return value
+
+
+STATUS_FILTER_DESCRIPTION = (
+    "Lifecycle filter: 'all' (default) returns active and expired memories "
+    "together so callers can label them, 'active' or 'expired' narrows to one."
+)
+
+
 class RecallRequest(BaseModel):
     """Request body for semantic memory recall."""
 
     query: str = Field(..., min_length=1, description="Search query")
     limit: int | None = Field(default=None, ge=1, description="Max results")
+    status: StatusFilter = Field(default="all", description=STATUS_FILTER_DESCRIPTION)
     min_similarity: float | None = Field(
         default=None, ge=0.0, le=1.0, description="Minimum similarity score (0-1)"
     )
@@ -110,6 +164,8 @@ class RecallRequest(BaseModel):
     @field_validator("created_after", mode="before")
     @classmethod
     def parse_created_after(cls, v: object) -> datetime | None:
+        """Parse the inclusive lower timestamp bound for recall."""
+
         if v is None:
             return None
         return _parse_recall_temporal_bound(v, end_of_day=False)
@@ -117,6 +173,8 @@ class RecallRequest(BaseModel):
     @field_validator("created_before", mode="before")
     @classmethod
     def parse_created_before(cls, v: object) -> datetime | None:
+        """Parse the inclusive upper timestamp bound for recall."""
+
         if v is None:
             return None
         return _parse_recall_temporal_bound(v, end_of_day=True)
@@ -135,19 +193,30 @@ class RecallRequest(BaseModel):
         """Reject recall filters that are not supported memory types."""
         return _validate_memory_type_filters(value)
 
+    @field_validator("tags")
+    @classmethod
+    def tag_filters_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
+        """Reject tag filter values that would cause a 500 in the query builder."""
+        return _validate_recall_tag_filters(value)
+
 
 def _parse_recall_temporal_bound(v: object, *, end_of_day: bool) -> datetime:
+    # End-of-day must be END_OF_DAY (23:59:59.999999), matching
+    # parse_as_of_timestamp: the temporal filter compares with a strict `>`,
+    # so a 23:59:59 bound silently drops memories created in the final
+    # sub-second of the requested day. Date-only detection is delegated to the
+    # shared helper for the same reason as RecallAsOfRequest.parse_as_of.
     if isinstance(v, datetime):
         return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
     if isinstance(v, date):
-        boundary = time(23, 59, 59) if end_of_day else time(0, 0, 0)
+        boundary = END_OF_DAY if end_of_day else time(0, 0, 0)
         return datetime.combine(v, boundary, tzinfo=timezone.utc)
     if isinstance(v, str):
-        if "T" not in v and " " not in v:
+        if is_date_only(v):
             try:
-                boundary = time(23, 59, 59) if end_of_day else time(0, 0, 0)
+                boundary = END_OF_DAY if end_of_day else time(0, 0, 0)
                 return datetime.combine(
-                    date.fromisoformat(v), boundary, tzinfo=timezone.utc
+                    parse_date_only(v), boundary, tzinfo=timezone.utc
                 )
             except ValueError:
                 pass
@@ -178,6 +247,12 @@ class RecallAsOfRequest(BaseModel):
         """Reject as-of recall filters that are not supported memory types."""
         return _validate_memory_type_filters(value)
 
+    @field_validator("tags")
+    @classmethod
+    def tag_filters_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
+        """Reject tag filter values that would cause a 500 in the query builder."""
+        return _validate_recall_tag_filters(value)
+
     @field_validator("as_of", mode="before")
     @classmethod
     def parse_as_of(cls, v: object) -> datetime:
@@ -185,13 +260,14 @@ class RecallAsOfRequest(BaseModel):
         if isinstance(v, datetime):
             return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
         if isinstance(v, date):
-            return datetime.combine(v, time(23, 59, 59), tzinfo=timezone.utc)
+            return datetime.combine(v, END_OF_DAY, tzinfo=timezone.utc)
         if isinstance(v, str):
-            # Date-only (no time component) → end of day
-            if "T" not in v and " " not in v:
+            # Date-only (no time component) → end of day. Delegated to the shared
+            # helper so this route and the read service cannot drift apart.
+            if is_date_only(v):
                 try:
                     return datetime.combine(
-                        date.fromisoformat(v), time(23, 59, 59), tzinfo=timezone.utc
+                        parse_date_only(v), END_OF_DAY, tzinfo=timezone.utc
                     )
                 except ValueError:
                     pass
@@ -215,12 +291,19 @@ class RecallChangedSinceRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1, description="Max results")
     type: list[str] | None = Field(default=None, description="Memory type filters")
     tags: list[str] | None = Field(default=None, description="Tag filters")
+    status: StatusFilter = Field(default="all", description=STATUS_FILTER_DESCRIPTION)
 
     @field_validator("type")
     @classmethod
     def type_filters_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
         """Reject changed-since recall filters that are not supported memory types."""
         return _validate_memory_type_filters(value)
+
+    @field_validator("tags")
+    @classmethod
+    def tag_filters_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
+        """Reject tag filter values that would cause a 500 in the query builder."""
+        return _validate_recall_tag_filters(value)
 
     @field_validator("since", mode="before")
     @classmethod
@@ -231,11 +314,13 @@ class RecallChangedSinceRequest(BaseModel):
         if isinstance(v, date):
             return datetime.combine(v, time(0, 0, 0), tzinfo=timezone.utc)
         if isinstance(v, str):
-            # Date-only (no time component) → start of day
-            if "T" not in v and " " not in v:
+            # Date-only (no time component) → start of day. Uses the same shared
+            # helper as the other date-only paths in this module so all three
+            # agree on what counts as a date, on every supported Python.
+            if is_date_only(v):
                 try:
                     return datetime.combine(
-                        date.fromisoformat(v), time(0, 0, 0), tzinfo=timezone.utc
+                        parse_date_only(v), time(0, 0, 0), tzinfo=timezone.utc
                     )
                 except ValueError:
                     pass
@@ -255,6 +340,7 @@ class RecallRecentRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1, description="Max results")
     type: list[str] | None = Field(default=None, description="Memory type filters")
     tags: list[str] | None = Field(default=None, description="Tag filters")
+    status: StatusFilter = Field(default="all", description=STATUS_FILTER_DESCRIPTION)
     created_after: datetime | date | None = Field(
         default=None,
         description=(
@@ -276,9 +362,17 @@ class RecallRecentRequest(BaseModel):
         """Reject recent-recall filters that are not supported memory types."""
         return _validate_memory_type_filters(value)
 
+    @field_validator("tags")
+    @classmethod
+    def tag_filters_must_be_valid(cls, value: list[str] | None) -> list[str] | None:
+        """Reject tag filter values that would cause a 500 in the query builder."""
+        return _validate_recall_tag_filters(value)
+
     @field_validator("created_after", mode="before")
     @classmethod
     def parse_created_after(cls, v: object) -> datetime | None:
+        """Parse the inclusive lower timestamp bound for recent recall."""
+
         if v is None:
             return None
         return _parse_recall_temporal_bound(v, end_of_day=False)
@@ -286,9 +380,38 @@ class RecallRecentRequest(BaseModel):
     @field_validator("created_before", mode="before")
     @classmethod
     def parse_created_before(cls, v: object) -> datetime | None:
+        """Parse the inclusive upper timestamp bound for recent recall."""
+
         if v is None:
             return None
         return _parse_recall_temporal_bound(v, end_of_day=True)
+
+
+class MemoryExpireRequest(BaseModel):
+    """Request body for expiring a single memory."""
+
+    reason: str = Field(
+        default="manual",
+        description=(
+            "Why this memory expired, stamped as `expired_by`. Defaults to "
+            "'manual'. Bounded to letters, digits, '.', '_' and '-'."
+        ),
+    )
+
+
+class PolicyPresetRequest(BaseModel):
+    """Request body for adopting a predefined policy bundle."""
+
+    name: str = Field(..., description="Preset name, e.g. 'balanced'")
+
+
+class PolicyApplyRequest(BaseModel):
+    """Request body for a policy sweep or purge."""
+
+    dry_run: bool = Field(
+        default=False,
+        description="Report what would change without writing anything",
+    )
 
 
 class MemoryEditRequest(BaseModel):
@@ -296,10 +419,10 @@ class MemoryEditRequest(BaseModel):
 
     title: str | None = Field(default=None, max_length=100)
     content: str | None = Field(default=None, max_length=10000)
-    type: str | None = None
+    type: MemoryType | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    tags: list[str] | None = None
-    source: str | None = None
+    tags: BoundedTags | None = None
+    source: MemorySource | None = None
 
     def to_updates(self) -> dict[str, object]:
         """Return only fields the caller explicitly wants to update."""
@@ -317,6 +440,8 @@ def enforce_session_scope(session: Session, agent_id: str) -> None:
 
 
 def resolve_recall_limit(request_limit: int | None) -> int:
+    """Resolve and validate the effective recall result limit."""
+
     recall_cfg = _config_manager.get_recall_config()
     raw_limit = (
         request_limit
@@ -327,7 +452,8 @@ def resolve_recall_limit(request_limit: int | None) -> int:
         limit = int(raw_limit)
     except (TypeError, ValueError) as e:
         raise HTTPException(
-            status_code=400, detail=f"Invalid recall configuration: {e}"
+            status_code=400,
+            detail=redact_sensitive_text(f"Invalid recall configuration: {e}"),
         ) from e
     if limit < 1:
         raise HTTPException(
@@ -401,10 +527,11 @@ async def remember(
         if is_successful_write_result(result):
             session_service = get_session_service()
             await asyncio.to_thread(
-                session_service.log_memory_to_session_summary,
+                session_service.try_log_memory_to_session_summary,
                 agent_id=agent_id,
                 session_id=session.session_id,
                 memory_record=memory,
+                memory_id=result.get("id"),
             )
 
         return {
@@ -459,17 +586,25 @@ async def batch_remember(
             title = item.title or (
                 item.content[:47] + "..." if len(item.content) > 50 else item.content
             )
-            memory = MemoryRecord(
-                type=cast(MemoryType, item.type),
-                title=title,
-                content=item.content,
-                agent_id=agent_id,
-                actor_id=agent_id,
-                confidence=item.confidence,
-                tags=item.tags or [],
-                source=item.source,
-                provenance=cast(ProvenanceType, item.provenance),
-            )
+            kwargs: dict[str, Any] = {
+                "type": cast(MemoryType, item.type),
+                "title": title,
+                "content": item.content,
+                "agent_id": agent_id,
+                "actor_id": agent_id,
+                "confidence": item.confidence,
+                "tags": item.tags or [],
+                "source": item.source,
+                "provenance": cast(ProvenanceType, item.provenance),
+            }
+            if item.status is not None:
+                kwargs["status"] = item.status
+            if item.expired_at is not None:
+                kwargs["expired_at"] = item.expired_at
+            if item.expired_by is not None:
+                kwargs["expired_by"] = item.expired_by
+
+            memory = MemoryRecord(**kwargs)
             memory_records.append(memory)
 
         # Store in batch
@@ -485,11 +620,13 @@ async def batch_remember(
             item_result = batch_results[index] if index < len(batch_results) else None
             if not is_successful_write_result(item_result):
                 continue
+            memory_id = item_result.get("id") if isinstance(item_result, dict) else None
             await asyncio.to_thread(
-                session_service.log_memory_to_session_summary,
+                session_service.try_log_memory_to_session_summary,
                 agent_id=agent_id,
                 session_id=session.session_id,
                 memory_record=record,
+                memory_id=memory_id,
             )
 
         return {
@@ -649,16 +786,35 @@ async def extract_memories_from_conversation(
         )
 
         session_service = get_session_service()
-        batch_results = result.get("results", [])
-        for index, record in enumerate(memory_records):
-            memory_id = (
-                batch_results[index].get("id") if index < len(batch_results) else None
+
+        if not isinstance(result, dict):
+            raise MemoryOperationError(
+                message="Data corruption detected: Received malformed batch result from storage layer.",
+                details={"item_preview": str(result)[:100]},
             )
+
+        batch_results = result.get("results", [])
+        if not isinstance(batch_results, list):
+            raise MemoryOperationError(
+                message="Data corruption detected: Received malformed batch result array from storage layer.",
+                details={"item_preview": str(batch_results)[:100]},
+            )
+
+        for index, record in enumerate(memory_records):
             item_result = batch_results[index] if index < len(batch_results) else None
+            if item_result is not None and (
+                not isinstance(item_result, dict) or not item_result
+            ):
+                raise MemoryOperationError(
+                    message="Data corruption detected: Received malformed batch result from storage layer.",
+                    details={"item_preview": str(item_result)[:100]},
+                )
+
+            memory_id = item_result.get("id") if item_result else None
             if not is_successful_write_result(item_result):
                 continue
             await asyncio.to_thread(
-                session_service.log_memory_to_session_summary,
+                session_service.try_log_memory_to_session_summary,
                 agent_id=agent_id,
                 session_id=session.session_id,
                 memory_record=record,
@@ -862,7 +1018,8 @@ async def recall(
         )
     except (TypeError, ValueError) as e:
         raise HTTPException(
-            status_code=400, detail=f"Invalid recall configuration: {e}"
+            status_code=400,
+            detail=redact_sensitive_text(f"Invalid recall configuration: {e}"),
         )
     try:
         # Initialize memory read service
@@ -882,6 +1039,7 @@ async def recall(
             created_before=request.created_before.isoformat()
             if request.created_before
             else None,
+            status=request.status,
             limit=limit,
         )
 
@@ -1020,6 +1178,7 @@ async def generate_daily_summary(
     agent_id: str,
     request: DailySummaryRequest = Body(default_factory=DailySummaryRequest),
     session: Session = Depends(get_current_session),
+    moorcheh_api_key: str = Depends(get_moorcheh_api_key),
 ):
     """
     Generate the on-demand daily AI summary for an agent/date.
@@ -1029,11 +1188,15 @@ async def generate_daily_summary(
     """
     enforce_session_scope(session, agent_id)
 
-    resolved_date = request.date or datetime.now().strftime("%Y-%m-%d")
+    resolved_date = request.date or utc_date_str()
     _validate_summary_key(agent_id, resolved_date)
     try:
+        client = DirectClient(moorcheh_api_key)
+        client.session_token = session.session_token
+        client.agent_id = agent_id
+
         result = await asyncio.to_thread(
-            DirectClient(settings.MOORCHEH_API_KEY).generate_daily_summary,
+            client.generate_daily_summary,
             agent_id,
             resolved_date,
             None,
@@ -1053,6 +1216,7 @@ async def generate_conflict_report(
     agent_id: str,
     request: ConflictDetectRequest = Body(default_factory=ConflictDetectRequest),
     session: Session = Depends(get_current_session),
+    moorcheh_api_key: str = Depends(get_moorcheh_api_key),
 ):
     """
     Generate the conflict report for an agent/date.
@@ -1061,11 +1225,11 @@ async def generate_conflict_report(
     """
     enforce_session_scope(session, agent_id)
 
-    resolved_date = request.date or datetime.now().strftime("%Y-%m-%d")
+    resolved_date = request.date or utc_date_str()
     _validate_summary_key(agent_id, resolved_date)
     try:
         result = await asyncio.to_thread(
-            DirectClient(settings.MOORCHEH_API_KEY).generate_conflict_report,
+            DirectClient(moorcheh_api_key).generate_conflict_report,
             agent_id,
             resolved_date,
         )
@@ -1084,6 +1248,7 @@ async def list_conflicts(
     agent_id: str,
     date: str | None = Query(None, description="Conflict report date (YYYY-MM-DD)"),
     session: Session = Depends(get_current_session),
+    moorcheh_api_key: str = Depends(get_moorcheh_api_key),
 ):
     """
     List unresolved conflicts for an agent.
@@ -1096,11 +1261,11 @@ async def list_conflicts(
     # Enforce session scope
     enforce_session_scope(session, agent_id)
 
-    resolved_date = date or datetime.now().strftime("%Y-%m-%d")
+    resolved_date = date or utc_date_str()
     _validate_summary_key(agent_id, resolved_date)
     try:
         conflicts = await asyncio.to_thread(
-            DirectClient(settings.MOORCHEH_API_KEY).list_conflicts,
+            DirectClient(moorcheh_api_key).list_conflicts,
             agent_id,
             resolved_date,
         )
@@ -1120,6 +1285,7 @@ async def resolve_conflict(
     agent_id: str,
     request: ConflictResolveRequest = Body(...),
     session: Session = Depends(get_current_session),
+    moorcheh_api_key: str = Depends(get_moorcheh_api_key),
 ):
     """
     Resolve a conflict for an agent.
@@ -1128,11 +1294,11 @@ async def resolve_conflict(
     """
     enforce_session_scope(session, agent_id)
 
-    resolved_date = request.date or datetime.now().strftime("%Y-%m-%d")
+    resolved_date = request.date or utc_date_str()
     _validate_summary_key(agent_id, resolved_date)
     try:
         result = await asyncio.to_thread(
-            DirectClient(settings.MOORCHEH_API_KEY).resolve_conflict,
+            DirectClient(moorcheh_api_key).resolve_conflict,
             agent_id,
             resolved_date,
             request.conflict_index,
@@ -1228,6 +1394,7 @@ async def recall_changed_since(
             agent_id=agent_id,
             type=request.type,
             tags=request.tags,
+            status=request.status,
             limit=limit,
         )
 
@@ -1274,6 +1441,7 @@ async def recall_recent(
             agent_id=agent_id,
             type=request.type,
             tags=request.tags,
+            status=request.status,
             limit=limit,
             created_after=request.created_after.isoformat()
             if request.created_after
@@ -1288,8 +1456,341 @@ async def recall_recent(
             "session_id": session.session_id,
             "memories": result["results"],
             "count": result["total_found"],
+            "total_available": result.get("total_available"),
             "temporal_mode": "recent",
         }
 
+    except Exception as e:
+        raise map_error_to_http_exception(e)
+
+
+@router.post("/{agent_id}/recall/all", response_model=TemporalRecallResponse)
+async def recall_all(
+    agent_id: str,
+    request: RecallRecentRequest = Body(...),
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Recall ALL stored memories for the UI (bypasses MAX_K limit).
+
+    Returns memories sorted by created_at descending (newest first).
+    Optionally filter by memory type.
+
+    Requires:
+    - X-Session-Token: {session_token}
+
+    The session must be for the specified agent_id.
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        read_service = MemoryReadService(client)
+
+        result = await asyncio.to_thread(
+            read_service.search_recent,
+            agent_id=agent_id,
+            type=request.type,
+            tags=request.tags,
+            status=request.status,
+            limit=request.limit
+            or 5000,  # Bound the UI response to prevent huge payloads
+            created_after=request.created_after.isoformat()
+            if request.created_after
+            else None,
+            created_before=request.created_before.isoformat()
+            if request.created_before
+            else None,
+        )
+
+        return {
+            "agent_id": agent_id,
+            "session_id": session.session_id,
+            "memories": result["results"],
+            "count": result["total_found"],
+            "total_available": result.get("total_available"),
+            "temporal_mode": "recent",
+        }
+
+    except Exception as e:
+        raise map_error_to_http_exception(e)
+
+
+# Memory lifecycle: expire / restore
+
+
+@router.post("/{agent_id}/memories/{memory_id}/expire")
+async def expire_memory(
+    agent_id: str,
+    memory_id: str,
+    request: MemoryExpireRequest = Body(default=MemoryExpireRequest()),
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Expire one memory without deleting it (Session-based).
+
+    The memory stays recallable and keeps its content; it is stamped
+    ``expired`` with the time and reason, and labelled as such in recall.
+    Reversible via the restore endpoint.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        write_service = MemoryWriteService(client)
+        result = await asyncio.to_thread(
+            write_service.set_lifecycle,
+            memory_id,
+            session.namespace,
+            expired=True,
+            reason=request.reason,
+        )
+        return {
+            "agent_id": agent_id,
+            "session_id": session.session_id,
+            "memory_id": memory_id,
+            "status": "expired",
+            "expired_at": result.get("expired_at"),
+            "expired_by": result.get("expired_by"),
+        }
+    except Exception as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(
+                status_code=404, detail=f"Memory '{memory_id}' was not found."
+            )
+        raise map_error_to_http_exception(e)
+
+
+@router.post("/{agent_id}/memories/{memory_id}/restore")
+async def restore_memory(
+    agent_id: str,
+    memory_id: str,
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Return an expired memory to the active state (Session-based).
+
+    Clears the expiry stamp entirely.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        write_service = MemoryWriteService(client)
+        await asyncio.to_thread(
+            write_service.set_lifecycle,
+            memory_id,
+            session.namespace,
+            expired=False,
+        )
+        return {
+            "agent_id": agent_id,
+            "session_id": session.session_id,
+            "memory_id": memory_id,
+            "status": "active",
+        }
+    except Exception as e:
+        if "not found" in str(e).lower():
+            raise HTTPException(
+                status_code=404, detail=f"Memory '{memory_id}' was not found."
+            )
+        raise map_error_to_http_exception(e)
+
+
+# Expiry policies
+
+
+@router.get("/{agent_id}/policy")
+async def get_policy(
+    agent_id: str,
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Return the agent's expiry policy (Session-based).
+
+    An agent with no policy set returns an empty one, which expires nothing.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        service = MemoryPolicyService(client)
+        policy = await asyncio.to_thread(service.load_policy, agent_id)
+        return {
+            "agent_id": agent_id,
+            "policy": policy.model_dump(mode="json", exclude_none=True),
+            "is_empty": policy.is_empty(),
+        }
+    except Exception as e:
+        raise map_error_to_http_exception(e)
+
+
+@router.put("/{agent_id}/policy")
+async def set_policy(
+    agent_id: str,
+    policy: MemoryPolicy = Body(...),
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Replace the agent's expiry policy (Session-based).
+
+    Saving a policy does not expire anything on its own — run the apply
+    endpoint, or let the nightly sweep pick it up.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        service = MemoryPolicyService(client)
+        path = await asyncio.to_thread(service.save_policy, agent_id, policy)
+        return {
+            "agent_id": agent_id,
+            "policy": policy.model_dump(mode="json", exclude_none=True),
+            "path": str(path),
+        }
+    except Exception as e:
+        raise map_error_to_http_exception(e)
+
+
+@router.get("/{agent_id}/policy/presets")
+async def list_policy_presets(
+    agent_id: str,
+    session: Session = Depends(get_current_session),
+):
+    """
+    List the predefined policy bundles (Session-based).
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+    return {"presets": list_presets()}
+
+
+@router.get("/{agent_id}/policy/presets/{name}")
+async def get_policy_preset(
+    agent_id: str,
+    name: str,
+    session: Session = Depends(get_current_session),
+):
+    """
+    Return one preset's full policy without adopting it (Session-based).
+
+    Lets a caller preview exactly what a preset contains before committing,
+    which is what makes an informed confirmation possible.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        policy = load_preset(name)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=redact_sensitive_text(str(e)))
+
+    return {
+        "name": name,
+        "description": PRESETS[name]["description"],
+        "policy": policy.model_dump(mode="json", exclude_none=True),
+    }
+
+
+@router.post("/{agent_id}/policy/preset")
+async def apply_policy_preset(
+    agent_id: str,
+    request: PolicyPresetRequest = Body(...),
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Adopt a predefined policy bundle as the agent's policy (Session-based).
+
+    Overwrites any existing policy. Nothing expires until a sweep runs.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        policy = load_preset(request.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=redact_sensitive_text(str(e)))
+
+    try:
+        service = MemoryPolicyService(client)
+        await asyncio.to_thread(service.save_policy, agent_id, policy)
+        return {
+            "agent_id": agent_id,
+            "preset": request.name,
+            "policy": policy.model_dump(mode="json", exclude_none=True),
+        }
+    except Exception as e:
+        raise map_error_to_http_exception(e)
+
+
+@router.post("/{agent_id}/policy/apply")
+async def apply_policy(
+    agent_id: str,
+    request: PolicyApplyRequest = Body(default=PolicyApplyRequest()),
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Sweep the agent's memories and expire everything the policy matches.
+
+    Pass ``dry_run: true`` to see exactly what would be expired, with per-rule
+    counts, without writing anything.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        service = MemoryPolicyService(client)
+        return await asyncio.to_thread(
+            service.apply_policies, agent_id, dry_run=request.dry_run
+        )
+    except Exception as e:
+        raise map_error_to_http_exception(e)
+
+
+@router.post("/{agent_id}/policy/purge")
+async def purge_expired_memories(
+    agent_id: str,
+    request: PolicyApplyRequest = Body(default=PolicyApplyRequest()),
+    session: Session = Depends(get_current_session),
+    client=Depends(get_moorcheh_client),
+):
+    """
+    Permanently delete memories expired longer than the policy's purge window.
+
+    Destructive and irreversible. Disabled unless the policy sets
+    ``purge_expired_after``. Pass ``dry_run: true`` to preview.
+
+    Requires:
+    - X-Session-Token: {session_token}
+    """
+    enforce_session_scope(session, agent_id)
+
+    try:
+        service = MemoryPolicyService(client)
+        return await asyncio.to_thread(
+            service.purge_expired, agent_id, dry_run=request.dry_run
+        )
     except Exception as e:
         raise map_error_to_http_exception(e)

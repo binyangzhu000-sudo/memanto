@@ -6,10 +6,13 @@ Serves the Web UI static files and provides UI-specific API endpoints.
 
 import asyncio
 import ipaddress
+import json
 import os
 import re
 import signal
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,15 +24,31 @@ from fastapi import (
     Request,
     Response,
 )
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+from memanto.app.clients.agent_conflict import (
+    CANCELLED_MESSAGE,
+    conflict_progress_step,
+    describe_conflict_progress,
+)
 from memanto.app.clients.backend import Backend
 from memanto.app.config import settings
-from memanto.app.routes.auth_deps import clear_session_cookie, set_session_cookie
+from memanto.app.routes.auth_deps import (
+    SESSION_COOKIE_NAME,
+    _has_forwarded_non_loopback,
+    _is_cross_site_browser_request,
+    _is_loopback_host_header,
+    clear_session_cookie,
+    set_session_cookie,
+)
+from memanto.app.services.session_service import get_session_service
+from memanto.app.utils.errors import MemoryOperationError, redact_sensitive_text
+from memanto.app.utils.temporal_helpers import utc_date_str
 from memanto.app.utils.validation import validate_safe_id
 from memanto.cli.client.direct_client import DirectClient
-from memanto.cli.config.manager import ConfigManager
+from memanto.cli.config.manager import ConfigManager, _validate_server_port
 from memanto.cli.connect.agent_registry import AGENT_REGISTRY, list_agents
 from memanto.cli.connect.engine import install_agent, remove_agent
 
@@ -42,6 +61,10 @@ _config_manager = ConfigManager()
 STATIC_DIR = Path(__file__).parent.parent / "static"
 _SAFE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Upper bound on the activity window a caller can request. Matches the log's
+# own retention, so a larger value could only ever scan empty days.
+ACTIVITY_MAX_DAYS = 30
+
 
 def _validate_agent_id(agent_id: str) -> None:
     """Reject agent identifiers that cannot be safely embedded in file paths."""
@@ -49,6 +72,36 @@ def _validate_agent_id(agent_id: str) -> None:
         validate_safe_id(agent_id, "agent_id")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid agent identifier")
+
+
+def _resolve_ui_agent_id(
+    *,
+    body_agent_id: str | None = None,
+    query_agent_id: str | None = None,
+    request: Request | None = None,
+) -> str:
+    """Resolve agent for UI routes: explicit id, session marker, then browser cookie."""
+    for candidate in (body_agent_id, query_agent_id):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+
+    aid, _token = _config_manager.get_active_session()
+    if aid:
+        return aid
+
+    if request is not None:
+        cookie = request.cookies.get(SESSION_COOKIE_NAME)
+        if cookie:
+            try:
+                session_service = get_session_service()
+                payload = session_service.validate_session(cookie)
+                session = session_service.get_session(payload.agent_id)
+                if session and session.is_active():
+                    return session.agent_id
+            except Exception:
+                pass
+
+    raise HTTPException(status_code=400, detail="No active agent")
 
 
 def _validate_summary_key(agent_id: str, date: str) -> None:
@@ -81,13 +134,40 @@ async def _require_local(request: Request) -> None:
     network addresses would let any reachable host kill the server, enumerate
     the filesystem, or replace API credentials without authentication.
     """
+    # MEM-01: a browser page on any other origin can drive fetches to
+    # 127.0.0.1 (DNS rebinding / localhost XSS). Reject non-whitelisted
+    # browser origins before the loopback check so admin endpoints stay
+    # unreadable from arbitrary web pages.
+    from memanto.app.routes.auth_deps import _require_allowed_origin
+
+    _require_allowed_origin(request)
+
     client_host = request.client.host if request.client else None
-    if not _is_loopback(client_host):
+    if not _is_loopback(client_host) or _has_forwarded_non_loopback(request):
         raise HTTPException(
             status_code=403,
             detail=(
                 "UI management endpoints are only accessible from localhost. "
                 f"Request origin: {client_host}"
+            ),
+        )
+
+    if _is_cross_site_browser_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="UI management endpoints reject cross-site browser requests.",
+        )
+
+    # A loopback TCP peer is necessary but not sufficient: a DNS-rebinding
+    # page on an attacker domain makes the server see a 127.0.0.1 client
+    # while the Host header names the attacker origin. The Host header is
+    # the only signal that distinguishes "local UI on localhost" from
+    # "attacker domain bound to loopback", so require it to name loopback.
+    if not _is_loopback_host_header(request.headers.get("host")):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "UI management endpoints must be requested with a loopback Host header."
             ),
         )
 
@@ -188,15 +268,44 @@ async def update_ui_config(updates: dict, _: None = Depends(_require_local)):
             detail=f"Cannot update keys: {', '.join(rejected)}. Allowed: {', '.join(allowed_keys)}",
         )
 
-    if "schedule_time" in updates:
-        _config_manager.set_schedule_time(updates["schedule_time"])
+    if "server" in updates and isinstance(updates["server"], dict):
+        server_updates = updates["server"]
+        if "port" in server_updates:
+            try:
+                server_updates["port"] = _validate_server_port(server_updates["port"])
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail=redact_sensitive_text(str(exc))
+                ) from exc
 
-    if "session" in updates and isinstance(updates["session"], dict):
-        data = _config_manager.load_yaml()
-        if "session" not in data:
-            data["session"] = {}
-        data["session"].update(updates["session"])
-        _config_manager.save_yaml(data)
+    if "schedule_time" in updates:
+        try:
+            _config_manager.set_schedule_time(updates["schedule_time"])
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=redact_sensitive_text(str(e))
+            ) from e
+
+    if "session" in updates:
+        if not isinstance(updates["session"], dict):
+            raise HTTPException(status_code=400, detail="session must be an object")
+        try:
+            _config_manager.set_session_config(updates["session"])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=redact_sensitive_text(str(exc))
+            ) from exc
+
+        # config.yaml is overlaid onto settings at process start, so apply the
+        # session toggles to the running server too - otherwise flipping them
+        # in the UI would not take effect until the next restart.
+        for _yaml_key, _settings_attr in (
+            ("auto_renew_enabled", "SESSION_AUTO_RENEW_ENABLED"),
+            ("auto_recreate_enabled", "SESSION_AUTO_RECREATE_ENABLED"),
+        ):
+            _toggle = updates["session"].get(_yaml_key)
+            if isinstance(_toggle, bool):
+                setattr(settings, _settings_attr, _toggle)
 
     if "cli" in updates and isinstance(updates["cli"], dict):
         data = _config_manager.load_yaml()
@@ -221,15 +330,18 @@ async def update_ui_config(updates: dict, _: None = Depends(_require_local)):
         if _config_manager.get_backend() == Backend.ON_PREM:
             _update_onprem_answer(ans)
         else:
-            _config_manager.set_answer_config(
-                model=ans.get("model"),
-                temperature=float(ans["temperature"]) if "temperature" in ans else None,
-                answer_limit=int(ans["answer_limit"])
-                if "answer_limit" in ans
-                else None,
-                threshold=float(ans["threshold"]) if "threshold" in ans else None,
-                kiosk_mode=bool(ans["kiosk_mode"]) if "kiosk_mode" in ans else None,
-            )
+            try:
+                _config_manager.set_answer_config(
+                    model=ans.get("model"),
+                    temperature=ans.get("temperature"),
+                    answer_limit=ans.get("answer_limit"),
+                    threshold=ans.get("threshold"),
+                    kiosk_mode=ans.get("kiosk_mode") if "kiosk_mode" in ans else None,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail=redact_sensitive_text(str(exc))
+                ) from exc
 
     if "recall" in updates and isinstance(updates["recall"], dict):
         rec = updates["recall"]
@@ -295,12 +407,22 @@ def _update_onprem_answer(ans: dict) -> None:
 
     embedding_key = _recover_moorcheh_api_key("embedding", embedding_provider)
     try:
-        from moorcheh.user_config import (  # type: ignore[import-not-found]
-            EmbeddingConfig,
-            LlmConfig,
-            default_base_url,
-            save_runtime_config,
-        )
+        # moorcheh-client 0.1.5 moved user_config into the cli subpackage;
+        # try the new path first and fall back so 0.1.3-0.1.5 all work.
+        try:
+            from moorcheh.cli.user_config import (  # type: ignore[import-not-found,import-untyped]
+                EmbeddingConfig,
+                LlmConfig,
+                default_base_url,
+                save_runtime_config,
+            )
+        except ImportError:
+            from moorcheh.user_config import (  # type: ignore[import-not-found,import-untyped]
+                EmbeddingConfig,
+                LlmConfig,
+                default_base_url,
+                save_runtime_config,
+            )
 
         save_runtime_config(
             EmbeddingConfig(
@@ -319,11 +441,12 @@ def _update_onprem_answer(ans: dict) -> None:
     except ImportError as e:
         raise HTTPException(
             status_code=500,
-            detail=f"moorcheh-client not installed: {e}",
+            detail=redact_sensitive_text(f"moorcheh-client not installed: {e}"),
         )
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Failed to persist LLM config: {e}"
+            status_code=500,
+            detail=redact_sensitive_text(f"Failed to persist LLM config: {e}"),
         )
 
     _config_manager.set_onprem_state(llm_provider=provider, llm_model=model)
@@ -430,7 +553,10 @@ async def _do_restart_onprem_backend(_asyncio, subprocess, _httpx):
     try:
         await _asyncio.to_thread(subprocess.run, up_args, check=True, timeout=300)
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"`moorcheh up` failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=redact_sensitive_text(f"`moorcheh up` failed: {e}"),
+        )
     except subprocess.TimeoutExpired:
         raise HTTPException(
             status_code=500, detail="`moorcheh up` timed out after 5 minutes."
@@ -459,11 +585,32 @@ async def _do_restart_onprem_backend(_asyncio, subprocess, _httpx):
 async def update_api_key(body: dict, _: None = Depends(_require_local)):
     """
     Update the Moorcheh API key from the Web UI.
-    Expects: {"api_key": "new-key-value"}
+    Expects: {"api_key": "new-key-value", "current_key": "existing-key"}
+
+    When a key is already configured, the caller must supply the correct
+    current_key to authorize the replacement.  This prevents a loopback
+    attacker (e.g. via DNS rebinding) from silently swapping credentials.
     """
+    import secrets as _secrets
+
     new_key = body.get("api_key", "").strip()
     if not new_key:
         raise HTTPException(status_code=400, detail="API key cannot be empty")
+
+    existing = (_config_manager.get_api_key() or "").strip()
+    if existing:
+        presented = body.get("current_key", "").strip()
+        if not presented:
+            raise HTTPException(
+                status_code=403,
+                detail="current_key is required to replace an existing API key.",
+            )
+        if not _secrets.compare_digest(presented, existing):
+            raise HTTPException(
+                status_code=403,
+                detail="current_key does not match the configured API key.",
+            )
+
     _config_manager.set_api_key(new_key)
     preview = f"••••••••{new_key[-6:]}" if len(new_key) > 6 else "***"
     return {"status": "updated", "api_key_preview": preview}
@@ -471,6 +618,7 @@ async def update_api_key(body: dict, _: None = Depends(_require_local)):
 
 @router.get("/api/ui/conflicts")
 async def list_conflicts(
+    request: Request,
     agent_id: str | None = None,
     date: str | None = None,
     _: None = Depends(_require_local),
@@ -479,15 +627,12 @@ async def list_conflicts(
     List unresolved conflicts for an agent.
     Uses DirectClient.list_conflicts under the hood.
     """
-    from datetime import datetime as dt
-
-    if not agent_id:
-        aid, _session_token = _config_manager.get_active_session()
-        if not aid:
-            return {"conflicts": [], "count": 0, "message": "No active agent"}
-        agent_id = aid
+    try:
+        agent_id = _resolve_ui_agent_id(query_agent_id=agent_id, request=request)
+    except HTTPException:
+        return {"conflicts": [], "count": 0, "message": "No active agent"}
     if not date:
-        date = dt.now().strftime("%Y-%m-%d")
+        date = utc_date_str()
     _validate_summary_key(str(agent_id), str(date))
 
     try:
@@ -527,7 +672,9 @@ async def list_conflict_scans(
         agent_id = aid
     _validate_agent_id(str(agent_id))
 
-    conflicts_dir = Path.home() / ".memanto" / "conflicts"
+    from memanto.app.config import get_conflicts_dir
+
+    conflicts_dir = get_conflicts_dir()
     scans: dict[str, dict] = {}
     if conflicts_dir.exists():
         suffix = "_conflicts.json"
@@ -570,8 +717,6 @@ async def read_daily_summary(
 
     Response: {exists, agent_id, date, path, content}
     """
-    from datetime import datetime as dt
-
     from memanto.app.config import get_data_dir
 
     if not agent_id:
@@ -580,7 +725,7 @@ async def read_daily_summary(
             return {"exists": False, "message": "No active agent"}
         agent_id = aid
     if not date:
-        date = dt.now().strftime("%Y-%m-%d")
+        date = utc_date_str()
 
     _validate_summary_key(str(agent_id), str(date))
     path = get_data_dir() / "summaries" / f"{agent_id}_{date}.md"
@@ -594,7 +739,10 @@ async def read_daily_summary(
     try:
         content = path.read_text(encoding="utf-8")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read summary: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=redact_sensitive_text(f"Failed to read summary: {e}"),
+        )
     return {
         "exists": True,
         "agent_id": agent_id,
@@ -606,22 +754,17 @@ async def read_daily_summary(
 
 @router.post("/api/ui/daily-summary")
 async def generate_daily_summary(
-    body: dict | None = None, _: None = Depends(_require_local)
+    request: Request,
+    body: dict | None = None,
+    _: None = Depends(_require_local),
 ):
     """
     Trigger an on-demand daily summary for the active agent.
     Expects (optional): {"agent_id": "...", "date": "YYYY-MM-DD"}
     """
-    from datetime import datetime as dt
-
     body = body or {}
-    agent_id = body.get("agent_id")
-    if not agent_id:
-        aid, _session_token = _config_manager.get_active_session()
-        if not aid:
-            raise HTTPException(status_code=400, detail="No active agent")
-        agent_id = aid
-    date = body.get("date") or dt.now().strftime("%Y-%m-%d")
+    agent_id = _resolve_ui_agent_id(body_agent_id=body.get("agent_id"), request=request)
+    date = body.get("date") or utc_date_str()
     _validate_summary_key(str(agent_id), str(date))
 
     client = _build_ui_direct_client()
@@ -634,28 +777,23 @@ async def generate_daily_summary(
         )
         return {"agent_id": agent_id, "date": date, **result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=redact_sensitive_text(str(e)))
 
 
 @router.post("/api/ui/conflicts/generate")
 async def generate_conflict_report(
-    body: dict | None = None, _: None = Depends(_require_local)
+    request: Request,
+    body: dict | None = None,
+    _: None = Depends(_require_local),
 ):
     """
     Trigger an on-demand conflict report for the active agent. This is the
     same work the scheduled task performs.
     Expects (optional): {"agent_id": "...", "date": "YYYY-MM-DD"}
     """
-    from datetime import datetime as dt
-
     body = body or {}
-    agent_id = body.get("agent_id")
-    if not agent_id:
-        aid, _session_token = _config_manager.get_active_session()
-        if not aid:
-            raise HTTPException(status_code=400, detail="No active agent")
-        agent_id = aid
-    date = body.get("date") or dt.now().strftime("%Y-%m-%d")
+    agent_id = _resolve_ui_agent_id(body_agent_id=body.get("agent_id"), request=request)
+    date = body.get("date") or utc_date_str()
     _validate_summary_key(str(agent_id), str(date))
 
     client = _build_ui_direct_client()
@@ -666,7 +804,145 @@ async def generate_conflict_report(
         result = client.generate_conflict_report(agent_id=str(agent_id), date=str(date))
         return {"agent_id": agent_id, "date": date, **result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=redact_sensitive_text(str(e)))
+
+
+@router.post(
+    "/api/ui/conflicts/generate/stream",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "description": (
+                "SSE stream of conflict-detection progress and terminal payloads. "
+                "Events: `progress` (status updates with optional `message`, `step`, "
+                "and `detail`), `result` (final report JSON), `error` (failure message), "
+                "and `done` (stream end). Comment lines `: keepalive` are sent during "
+                "long waits."
+            ),
+            "content": {
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "format": "event-stream",
+                    }
+                }
+            },
+        },
+        400: {
+            "description": "No API key configured",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"detail": {"type": "string"}},
+                        "required": ["detail"],
+                    }
+                }
+            },
+        },
+    },
+)
+async def generate_conflict_report_stream(
+    request: Request,
+    body: dict | None = None,
+    _: None = Depends(_require_local),
+):
+    """Stream conflict-detection progress from Moorche agent/run as SSE."""
+    body = body or {}
+    agent_id = _resolve_ui_agent_id(body_agent_id=body.get("agent_id"), request=request)
+    date = body.get("date") or utc_date_str()
+    _validate_summary_key(str(agent_id), str(date))
+
+    client = _build_ui_direct_client()
+    if client is None:
+        raise HTTPException(status_code=400, detail="No API key configured")
+
+    async def event_generator():
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[str, str | None, Any]] = asyncio.Queue()
+        cancel_event = threading.Event()
+        active = True
+
+        def safe_put(item: tuple[str, str | None, Any]) -> None:
+            if active:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+
+        def on_event(event_name: str, data: dict[str, Any]) -> None:
+            if cancel_event.is_set():
+                return
+            safe_put(("progress", event_name, data))
+
+        def worker() -> None:
+            try:
+                result = client.generate_conflict_report(
+                    agent_id=str(agent_id),
+                    date=str(date),
+                    on_progress=on_event,
+                    cancel_event=cancel_event,
+                )
+                if cancel_event.is_set():
+                    return
+                safe_put(
+                    (
+                        "result",
+                        None,
+                        {"agent_id": agent_id, "date": date, **result},
+                    )
+                )
+            except MemoryOperationError as exc:
+                if str(exc) == CANCELLED_MESSAGE:
+                    return
+                safe_put(("error", None, str(exc)))
+            except Exception as exc:
+                safe_put(("error", None, str(exc)))
+
+        worker_future = loop.run_in_executor(None, worker)
+
+        try:
+            yield (
+                "event: progress\n"
+                f"data: {json.dumps({'event': 'started', 'message': 'Connecting to conflict detection…', 'step': 'start'})}\n\n"
+            )
+
+            while True:
+                try:
+                    kind, event_name, payload = await asyncio.wait_for(
+                        queue.get(), timeout=15.0
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if kind == "progress":
+                    data = payload if isinstance(payload, dict) else {}
+                    message = describe_conflict_progress(str(event_name), data)
+                    step = conflict_progress_step(str(event_name), data)
+                    if message or step:
+                        yield (
+                            "event: progress\n"
+                            f"data: {json.dumps({'event': event_name, 'message': message, 'step': step, 'detail': data}, default=str)}\n\n"
+                        )
+                elif kind == "result":
+                    yield f"event: result\ndata: {json.dumps(payload, default=str)}\n\n"
+                    yield "event: done\ndata: {}\n\n"
+                    break
+                elif kind == "error":
+                    yield f"event: error\ndata: {json.dumps({'message': payload})}\n\n"
+                    yield "event: done\ndata: {}\n\n"
+                    break
+        finally:
+            active = False
+            cancel_event.set()
+            worker_future.cancel()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/api/ui/conflicts/resolve")
@@ -707,9 +983,9 @@ async def resolve_conflict(body: dict, _: None = Depends(_require_local)):
         )
         return result
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=redact_sensitive_text(str(e)))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=redact_sensitive_text(str(e)))
 
 
 @router.get("/api/ui/connections")
@@ -738,7 +1014,8 @@ async def get_connections(_: None = Depends(_require_local)):
             {
                 "name": agent.name,
                 "display_name": agent.display_name,
-                "instruction_file": agent.instruction_file,
+                "instruction_local_file": agent.instruction_local_file,
+                "instruction_global_file": agent.instruction_global_file,
                 "skill_local_template": (
                     f"{agent.skill_local_dir}/memanto"
                     if agent.skill_local_dir
@@ -757,6 +1034,40 @@ async def get_connections(_: None = Depends(_require_local)):
             }
         )
     return {"cwd": str(Path.cwd()), "connections": items}
+
+
+@router.get("/api/ui/sessions")
+async def get_sessions(days: int = 7, _: None = Depends(_require_local)):
+    """MEMANTO sessions with the tools that took part, plus per-tool liveness.
+
+    Complements `/api/ui/connections`, which reports where MEMANTO is
+    *installed*. This reports what has actually been running.
+    """
+    from memanto.app.services.activity_service import get_activity_service
+
+    days = max(1, min(int(days), ACTIVITY_MAX_DAYS))
+    service = get_activity_service()
+    tools = service.live_tools(days)
+    return {
+        "days": days,
+        "sessions": service.list_sessions(days),
+        "tools": tools,
+        "live_count": sum(1 for t in tools if t["live"]),
+    }
+
+
+@router.get("/api/ui/sessions/{session_id}")
+async def get_session_detail(
+    session_id: str, days: int = 30, _: None = Depends(_require_local)
+):
+    """One MEMANTO session's summary plus its full event timeline."""
+    from memanto.app.services.activity_service import get_activity_service
+
+    days = max(1, min(int(days), ACTIVITY_MAX_DAYS))
+    detail = get_activity_service().get_session(session_id, days)
+    if detail["session"] is None:
+        raise HTTPException(status_code=404, detail=f"Unknown session: {session_id}")
+    return detail
 
 
 @router.get("/api/ui/browse")
@@ -818,6 +1129,109 @@ async def browse_path(
         "children": children,
         "quick_paths": quick,
     }
+
+
+@router.get("/api/ui/template-status")
+async def get_template_status(_: None = Depends(_require_local)):
+    """Check if agent instructions are outdated."""
+    from memanto.cli.connect.templates import TEMPLATE_VERSION
+    from memanto.cli.connect.updater import check_for_updates
+
+    try:
+        # Check both local and global installations
+        status = check_for_updates(project_dir=".")
+        return status
+    except Exception as e:
+        return {"outdated": False, "error": str(e), "latest_version": TEMPLATE_VERSION}
+
+
+@router.get("/api/ui/template-status/dismissed")
+async def get_template_status_dismissed(_: None = Depends(_require_local)):
+    """Get the currently dismissed instruction version."""
+    dismissed = _config_manager.get("cli.dismissed_template_version", "")
+    return {"version": dismissed}
+
+
+@router.post("/api/ui/template-status/dismiss")
+async def dismiss_template_status(_: None = Depends(_require_local)):
+    """Dismiss the instruction update warning for the current version."""
+    from memanto.cli.connect.templates import TEMPLATE_VERSION
+
+    _config_manager.set("cli.dismissed_template_version", TEMPLATE_VERSION)
+    return {"status": "success", "dismissed_version": TEMPLATE_VERSION}
+
+
+class AchievementsState(BaseModel):
+    """UI achievement progress: milestone id -> earned-at ISO timestamp,
+    metrics already observed once, and the best value seen per metric."""
+
+    earned: dict[str, str] = {}
+    seen: dict[str, bool] = {}
+    best: dict[str, int] = {}
+
+
+# Serializes reads and writes of achievements.json within this process, so a
+# read never races the os.replace() of a concurrent write.
+_achievements_lock = threading.Lock()
+
+
+def _achievements_path() -> Path:
+    from memanto.app.config import get_data_dir
+
+    return get_data_dir() / "achievements.json"
+
+
+@router.get("/api/ui/achievements")
+async def get_achievements(_: None = Depends(_require_local)):
+    """Return stored achievement progress. ``exists`` is False until the
+    first save, so the UI can migrate progress kept in older browser storage."""
+    path = _achievements_path()
+    with _achievements_lock:
+        if not path.exists():
+            return {"exists": False, "state": AchievementsState().model_dump()}
+        state = AchievementsState.model_validate_json(path.read_text(encoding="utf-8"))
+    return {"exists": True, "state": state.model_dump()}
+
+
+@router.put("/api/ui/achievements")
+async def put_achievements(state: AchievementsState, _: None = Depends(_require_local)):
+    """Replace stored achievement progress."""
+    path = _achievements_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with _achievements_lock:
+        tmp.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    return {"status": "success"}
+
+
+@router.post("/api/ui/template-status/update")
+async def apply_template_update(_: None = Depends(_require_local)):
+    """Update all active Memanto agent instructions in the workspace and globally."""
+    from memanto.cli.connect.updater import update_all_agents
+
+    try:
+        messages = update_all_agents(
+            project_dir=".", update_global=True, update_local=True
+        )
+
+        has_success = any("Successfully updated" in m for m in messages)
+        if has_success:
+            messages = [
+                m for m in messages if "No active Memanto integrations found" not in m
+            ]
+
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for m in messages:
+            if m not in seen:
+                seen.add(m)
+                deduped.append(m)
+
+        return {"status": "success", "messages": deduped}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/api/ui/connections/install")
@@ -916,7 +1330,21 @@ async def shutdown_server(
     return {"status": "shutting down"}
 
 
-_MIGRATE_PROVIDERS = ("mem0", "letta", "supermemory", "okf")
+_MIGRATE_PROVIDERS = (
+    "mem0",
+    "letta",
+    "supermemory",
+    "zep",
+    "hindsight",
+    "okf",
+    "langfuse",
+)
+
+# Providers with no cost/latency baseline to benchmark Memanto against: OKF is
+# a portable local format, Langfuse is an observability backend, not a memory
+# store being migrated off, and Zep/Hindsight have no compare module yet. The
+# UI hides the savings tiles when the savings object comes back empty.
+_NO_SAVINGS_PROVIDERS = ("okf", "langfuse", "zep", "hindsight")
 
 
 def _migrate_compact_metrics(provider: str, metrics: dict) -> dict:
@@ -970,10 +1398,181 @@ def _migrate_compact_metrics(provider: str, metrics: dict) -> dict:
     }
 
 
+def _langfuse_project_key(options: dict) -> str:
+    """Identify which Langfuse project this request is about."""
+    from memanto.cli.migrate.langfuse_config import project_key
+
+    return project_key(
+        project_id=options.get("project_id"), api_key=options.get("api_key")
+    )
+
+
+def _migrate_langfuse_ledger(
+    options: dict, agent_id: str = "preview"
+) -> tuple[Path, str, dict]:
+    """The Langfuse sync ledger, its path, and this request's scope.
+
+    Langfuse is a repeatable sync rather than a one-shot import, so the tile
+    must reconcile against the same ledger the CLI uses — otherwise every
+    click would rewrite every signature. The ledger is scoped by project and
+    destination agent so two projects, or two agents, never shadow each other.
+    """
+    from memanto.cli.migrate.langfuse_state import load_state, scope_key, state_path
+
+    path = state_path(_config_manager.get_migrate_dir("langfuse"))
+    scope = scope_key(_langfuse_project_key(options), agent_id)
+    return path, scope, load_state(path, scope)
+
+
+def _migrate_langfuse_config(options: dict) -> Any:
+    """Build the tile's ``CaptureConfig`` from stored settings plus this request.
+
+    Stored per-project settings are the baseline so the tile matches whatever
+    the CLI was configured with; fields present on the request override them.
+    Applied to file replays as well as live pulls, so the capture checkboxes
+    mean the same thing either way.
+    """
+    from memanto.cli.migrate.langfuse_config import (
+        ProjectConfig,
+        ScoreRuleError,
+        config_path,
+        load_project,
+        parse_score_rule,
+    )
+    from memanto.cli.migrate.langfuse_rules import CaptureConfig, parse_capture_modes
+
+    base_dir = _config_manager.get_migrate_dir("langfuse")
+    stored = load_project(config_path(base_dir), _langfuse_project_key(options))
+
+    def rules(key: str, fallback: list) -> list:
+        raw = options.get(key)
+        if not raw:
+            return fallback
+        try:
+            return [parse_score_rule(str(item)) for item in raw]
+        except ScoreRuleError as exc:
+            raise HTTPException(status_code=400, detail=redact_sensitive_text(str(exc)))
+
+    def number(key: str, fallback: float | None) -> float | None:
+        if options.get(key) in (None, ""):
+            return fallback
+        try:
+            return float(options[key])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"'{key}' must be a number.")
+
+    try:
+        merged = ProjectConfig(
+            capture=(
+                parse_capture_modes(options["capture"])
+                if options.get("capture")
+                else stored.capture
+            ),
+            score_fail_rules=rules("score_fail_rules", stored.score_fail_rules),
+            score_pass_rules=rules("score_pass_rules", stored.score_pass_rules),
+            latency_ms=number("latency_ms", stored.latency_ms),
+            latency_percentile=number("latency_percentile", stored.latency_percentile),
+            cost_usd=number("cost_usd", stored.cost_usd),
+            cost_percentile=number("cost_percentile", stored.cost_percentile),
+            group_by=options.get("group_by") or stored.group_by,
+        )
+        return CaptureConfig.from_project(merged)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=redact_sensitive_text(str(exc)))
+
+
+def _migrate_langfuse_export(api_key: str, options: dict) -> tuple[str, dict]:
+    """Pull a live Langfuse export using the tile's capture settings."""
+    from memanto.cli.analyze.langfuse_export import (
+        normalize_host,
+        run_langfuse_export,
+    )
+    from memanto.cli.migrate.langfuse_state import last_synced_at
+
+    config = _migrate_langfuse_config(options)
+    discover = bool(options.get("discover"))
+
+    since_days = options.get("since_days")
+    since: datetime | None
+    if since_days:
+        since = datetime.now(timezone.utc) - timedelta(days=int(since_days))
+    elif discover:
+        since = None
+    else:
+        _path, _scope, state = _migrate_langfuse_ledger(
+            options, str(options.get("agent_id") or "preview")
+        )
+        since = last_synced_at(state)
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    dest = _config_manager.get_migrate_dir("langfuse") / stamp
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        export_path, export = run_langfuse_export(
+            api_key.strip(),
+            dest,
+            host=normalize_host(
+                options.get("host") or _config_manager.get_langfuse_host()
+            ),
+            since=since,
+            capture=set(config.modes),
+            config=config,
+            discover=discover,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=redact_sensitive_text(str(exc)))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=redact_sensitive_text(f"Langfuse export failed: {exc}"),
+        )
+    return str(export_path), export
+
+
+def _migrate_savings(provider: str, export: dict) -> dict:
+    """Compact savings metrics, or ``{}`` for providers with no baseline."""
+    if provider in _NO_SAVINGS_PROVIDERS:
+        return {}
+    return _migrate_compact_metrics(provider, _migrate_get_metrics_fn(provider)(export))
+
+
+def _safe_migrate_source_path(file_path: str, provider: str) -> Path:
+    """Resolve a caller-supplied migration ``file`` inside the migrate dir.
+
+    Migration endpoints accepted an arbitrary server-side ``file`` path, which
+    let a caller read any ``.md``/JSON document the server process can open —
+    the parsed content is reflected straight back in the dry-run/discover
+    response. Confining the source to the provider's own migrate directory
+    (where legitimate exports are written) removes the read primitive while
+    keeping the documented workflow intact.
+    """
+    base_dir = _config_manager.get_migrate_dir(provider).resolve()
+    candidate = Path(file_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail="Invalid `file` path")
+
+    try:
+        resolved.relative_to(base_dir)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "`file` must live inside the migrate directory for this "
+                "provider. Absolute paths outside it are not allowed."
+            ),
+        )
+    return resolved
+
+
 def _migrate_load_or_export(
     provider: str,
     file_path: str | None,
     api_key: str | None,
+    options: dict | None = None,
 ) -> tuple[str, dict]:
     """Either load a JSON export from disk or pull one live with the API key.
 
@@ -984,9 +1583,11 @@ def _migrate_load_or_export(
     provider), so it has no ``api_key`` branch — ``file`` is required and
     points at a bundle directory or a single ``.md`` file.
     """
+    from memanto.cli.analyze.hindsight_export import run_hindsight_export
     from memanto.cli.analyze.letta_export import run_letta_export
     from memanto.cli.analyze.mem0_export import run_mem0_export
     from memanto.cli.analyze.supermemory_export import run_supermemory_export
+    from memanto.cli.analyze.zep_export import run_zep_export
     from memanto.cli.migrate.okf_loader import load_okf_bundle
     from memanto.cli.migrate.runner import load_export
 
@@ -994,9 +1595,9 @@ def _migrate_load_or_export(
         if not file_path:
             raise HTTPException(
                 status_code=400,
-                detail="`file` (server-side path to an OKF bundle directory or .md file) is required for OKF.",
+                detail="`file` (path to an OKF bundle directory or .md file inside the migrate directory) is required for OKF.",
             )
-        path = Path(file_path).expanduser()
+        path = _safe_migrate_source_path(file_path, provider)
         if not path.exists():
             raise HTTPException(
                 status_code=400, detail=f"OKF bundle not found: {file_path}"
@@ -1004,12 +1605,20 @@ def _migrate_load_or_export(
         return str(path), load_okf_bundle(path)
 
     if file_path:
-        path = Path(file_path).expanduser()
+        path = _safe_migrate_source_path(file_path, provider)
         if not path.exists() or not path.is_file():
             raise HTTPException(
                 status_code=400, detail=f"Export file not found: {file_path}"
             )
-        return str(path), load_export(path)
+        try:
+            return str(path), load_export(path)
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=redact_sensitive_text(
+                    f"Export file is not valid JSON: {file_path} ({exc})"
+                ),
+            )
 
     if not api_key or not api_key.strip():
         raise HTTPException(
@@ -1017,19 +1626,34 @@ def _migrate_load_or_export(
             detail="Either `file` (server-side path) or `api_key` is required.",
         )
 
+    # Langfuse takes capture modes and thresholds the other exporters don't.
+    if provider == "langfuse":
+        return _migrate_langfuse_export(api_key, options or {})
+
     exporters: dict[str, Any] = {
         "mem0": run_mem0_export,
         "letta": run_letta_export,
         "supermemory": run_supermemory_export,
+        "zep": run_zep_export,
+        "hindsight": run_hindsight_export,
     }
     exporter = exporters[provider]
+    # Hindsight is often self-hosted; ``host`` points at that server.
+    exporter_kwargs: dict[str, Any] = {}
+    if provider == "hindsight":
+        exporter_kwargs["base_url"] = (options or {}).get(
+            "host"
+        ) or _config_manager.get_hindsight_base_url()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     dest = _config_manager.get_migrate_dir(provider) / stamp
     dest.mkdir(parents=True, exist_ok=True)
     try:
-        export_path, export = exporter(api_key.strip(), dest)
+        export_path, export = exporter(api_key.strip(), dest, **exporter_kwargs)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"{provider} export failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=redact_sensitive_text(f"{provider} export failed: {e}"),
+        )
     return str(export_path), export
 
 
@@ -1064,11 +1688,19 @@ async def migrate_dry_run(body: dict, _: None = Depends(_require_local)):
             detail=f"provider must be one of: {', '.join(_MIGRATE_PROVIDERS)}",
         )
 
+    # Validated before the (possibly slow) export so a bad mode fails fast.
+    langfuse_config = _migrate_langfuse_config(body) if provider == "langfuse" else None
+
     source_label, export = _migrate_load_or_export(
-        provider, body.get("file"), body.get("api_key")
+        provider, body.get("file"), body.get("api_key"), body
     )
 
-    rows = map_export(provider, export)
+    if langfuse_config is not None:
+        from memanto.cli.migrate.langfuse_rules import build_rows
+
+        rows = build_rows(export, langfuse_config)
+    else:
+        rows = map_export(provider, export)
     src_count = source_count(provider, export)
 
     type_counts: dict[str, int] = {}
@@ -1076,16 +1708,27 @@ async def migrate_dry_run(body: dict, _: None = Depends(_require_local)):
         key = row.get("type") or "auto"
         type_counts[key] = type_counts.get(key, 0) + 1
 
-    # OKF has no cost/latency "compare" module (it's a portable local format,
-    # not a hosted provider to benchmark against) — the UI hides the savings
-    # tiles when this comes back empty.
-    savings = (
-        {}
-        if provider == "okf"
-        else _migrate_compact_metrics(
-            provider, _migrate_get_metrics_fn(provider)(export)
+    savings = _migrate_savings(provider, export)
+
+    # Langfuse reconciles against a ledger, so the preview must answer "what
+    # would change", not "what would be written" — a re-sync is mostly no-ops.
+    plan_counts: dict[str, int] = {}
+    warnings: list[str] = []
+    if provider == "langfuse":
+        from memanto.cli.migrate.langfuse_state import reconcile
+        from memanto.cli.migrate.runner import langfuse_warnings
+
+        _path, _scope, state = _migrate_langfuse_ledger(
+            body, str(body.get("agent_id") or "preview")
         )
-    )
+        plan = reconcile(rows, state)
+        plan_counts = {
+            "new": len(plan.new_rows),
+            "changed": len(plan.updates),
+            "unchanged": plan.unchanged,
+        }
+        matched = sum(int(row.get("occurrences") or 0) for row in rows)
+        warnings = langfuse_warnings(export, rows, matched, langfuse_config)
 
     sample = []
     for row in rows[:5]:
@@ -1110,6 +1753,70 @@ async def migrate_dry_run(body: dict, _: None = Depends(_require_local)):
         "sample": sample,
         "savings": savings,
         "batch_count": (len(rows) + 99) // 100,
+        "plan": plan_counts,
+        "warnings": warnings,
+    }
+
+
+@router.post("/api/ui/migrate/langfuse/discover")
+async def migrate_langfuse_discover(body: dict, _: None = Depends(_require_local)):
+    """Report what is actually in a Langfuse project, so the user can configure it.
+
+    Score names, value ranges, and per-operation latency/cost are all
+    project-specific, so the tile shows the user their own data rather than
+    asking them to guess at thresholds. Writes nothing.
+    """
+    from memanto.cli.migrate.langfuse_discover import discover
+
+    source_label, export = _migrate_load_or_export(
+        "langfuse", body.get("file"), body.get("api_key"), {**body, "discover": True}
+    )
+    report = discover(export)
+    report["source_label"] = source_label
+    return report
+
+
+@router.post("/api/ui/migrate/langfuse/config")
+async def migrate_langfuse_config(body: dict, _: None = Depends(_require_local)):
+    """Read or persist per-project Langfuse capture settings.
+
+    ``{"action": "save", ...}`` stores the supplied settings for the project
+    the credential belongs to; anything else just reads them back.
+    """
+    from memanto.cli.migrate.langfuse_config import (
+        ProjectConfig,
+        config_path,
+        load_project,
+        save_project,
+    )
+
+    base_dir = _config_manager.get_migrate_dir("langfuse")
+    path = config_path(base_dir)
+    key = _langfuse_project_key(body)
+
+    if str(body.get("action") or "").lower() == "save":
+        config = _migrate_langfuse_config(body)
+        save_project(
+            path,
+            key,
+            ProjectConfig(
+                capture=config.modes,
+                score_fail_rules=list(config.score_fail_rules),
+                score_pass_rules=list(config.score_pass_rules),
+                latency_ms=config.latency_ms,
+                latency_percentile=config.latency_percentile,
+                cost_usd=config.cost_usd,
+                cost_percentile=config.cost_percentile,
+                group_by=config.group_by,
+            ),
+        )
+
+    stored = load_project(path, key)
+    return {
+        "project_key": key,
+        "config": stored.as_dict(),
+        "unconfigured": stored.unconfigured_modes(),
+        "path": str(path),
     }
 
 
@@ -1121,7 +1828,7 @@ async def migrate_import(body: dict, _: None = Depends(_require_local)):
     maps, chunks at 100/req, and writes via ``DirectClient.batch_remember``.
     Returns numeric summary only — no LLM narrative.
     """
-    from memanto.cli.migrate.runner import run_migration
+    from memanto.cli.migrate.runner import run_langfuse_sync, run_migration
 
     provider = (body.get("provider") or "").strip().lower()
     if provider not in _MIGRATE_PROVIDERS:
@@ -1141,31 +1848,51 @@ async def migrate_import(body: dict, _: None = Depends(_require_local)):
     if client is None:
         raise HTTPException(status_code=400, detail="No Memanto API key configured.")
 
+    langfuse_config = _migrate_langfuse_config(body) if provider == "langfuse" else None
+
     source_label, export = _migrate_load_or_export(
-        provider, body.get("file"), body.get("api_key")
+        provider, body.get("file"), body.get("api_key"), body
     )
 
     started = time.perf_counter()
+    # Either a LangfuseSyncSummary or a MigrationSummary — both expose as_dict().
+    summary: Any
     try:
-        summary, _rows = run_migration(
-            provider=provider,
-            export=export,
-            client=client,
-            agent_id=str(agent_id),
-            dry_run=False,
-            on_progress=None,
-        )
+        if provider == "langfuse":
+            # Ledger-reconciled: re-clicking the tile updates recurring
+            # signatures in place instead of duplicating them.
+            from memanto.cli.migrate.langfuse_state import save_state
+
+            ledger_path, scope, state = _migrate_langfuse_ledger(body, str(agent_id))
+            summary, _rows, _plan = run_langfuse_sync(
+                export=export,
+                client=client,
+                agent_id=str(agent_id),
+                state=state,
+                dry_run=False,
+                config=langfuse_config,
+                on_progress=None,
+            )
+            # Hold the cursor back on failure so the next sync's window still
+            # covers the observations that were not stored.
+            save_state(ledger_path, state, scope, advance_cursor=summary.failed == 0)
+        else:
+            summary, _rows = run_migration(
+                provider=provider,
+                export=export,
+                client=client,
+                agent_id=str(agent_id),
+                dry_run=False,
+                on_progress=None,
+            )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Import failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=redact_sensitive_text(f"Import failed: {e}"),
+        )
     elapsed_ms = round((time.perf_counter() - started) * 1000)
 
-    savings = (
-        {}
-        if provider == "okf"
-        else _migrate_compact_metrics(
-            provider, _migrate_get_metrics_fn(provider)(export)
-        )
-    )
+    savings = _migrate_savings(provider, export)
 
     return {
         "provider": provider,
