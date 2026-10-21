@@ -46,12 +46,12 @@ def clear_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def isolate_sdk_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_moorcheh_sdk = types.ModuleType("moorcheh_sdk")
-    fake_moorcheh_sdk.AsyncMoorchehClient = object
-    fake_moorcheh_sdk.MoorchehClient = object
+    fake_moorcheh_sdk.AsyncMoorchehClient = object  # type: ignore[attr-defined]
+    fake_moorcheh_sdk.MoorchehClient = object  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "moorcheh_sdk", fake_moorcheh_sdk)
 
     fake_agent_service = types.ModuleType("memanto.app.services.agent_service")
-    fake_agent_service.get_moorcheh_client = lambda: None
+    fake_agent_service.get_moorcheh_client = lambda: None  # type: ignore[attr-defined]
     monkeypatch.setitem(
         sys.modules,
         "memanto.app.services.agent_service",
